@@ -26,6 +26,7 @@ add_custom_target(MagicCADAI ALL
 )
 
 fc_copy_sources(MagicCADAI "${CMAKE_BINARY_DIR}/Mod/MagicCADAI" ${MagicCADAI_SCRIPTS})
+fc_copy_sources(MagicCADAI "${CMAKE_BINARY_DIR}/Mod/MagicCADAI" ${MagicCADAI_ICONS})
 fc_copy_sources(
     MagicCADAI
     "${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_DATADIR}/Mod/MagicCADAI"

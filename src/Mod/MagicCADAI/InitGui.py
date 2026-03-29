@@ -8,8 +8,24 @@ import FreeCADGui as Gui
 
 class MagicCADAIWorkbench(Workbench):
     def __init__(self):
-        self.__class__.Icon = os.path.join(
-            os.path.dirname(__file__), "Resources", "icons", "MagicCADAIWorkbench.svg"
+        resource_root = FreeCAD.getResourceDir()
+        icon_candidates = (
+            os.path.join(
+                resource_root, "Mod", "MagicCADAI", "Resources", "icons", "MagicCADAIWorkbench.svg"
+            ),
+            os.path.join(
+                resource_root,
+                "share",
+                "Mod",
+                "MagicCADAI",
+                "Resources",
+                "icons",
+                "MagicCADAIWorkbench.svg",
+            ),
+        )
+        self.__class__.Icon = next(
+            (path for path in icon_candidates if os.path.exists(path)),
+            icon_candidates[0],
         )
         self.__class__.MenuText = "MagicCAD AI"
         self.__class__.ToolTip = "AI copilot and validation tools for MagicCAD"
