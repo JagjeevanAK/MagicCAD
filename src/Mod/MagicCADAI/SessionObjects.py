@@ -63,6 +63,8 @@ class SessionProxy(_BaseProxy):
         _ensure_property(obj, "App::PropertyString", "ModelName", "MagicCADAI", "Selected model", "")
         _ensure_property(obj, "App::PropertyString", "LastStatus", "MagicCADAI", "Last run status", "")
         _ensure_property(obj, "App::PropertyString", "LastSnapshotHash", "MagicCADAI", "Last snapshot hash", "")
+        _ensure_property(obj, "App::PropertyString", "PreviousResponseId", "MagicCADAI", "Last OpenAI response id", "")
+        _ensure_property(obj, "App::PropertyString", "LastPhase", "MagicCADAI", "Last assistant phase", "")
         _ensure_property(obj, "App::PropertyString", "LastUpdatedUtc", "MagicCADAI", "Last update time", "")
         _ensure_property(obj, "App::PropertyString", "Payload", "MagicCADAI", "Serialized session data", "{}")
 
@@ -166,7 +168,17 @@ def report_payload(report):
         return {}
 
 
-def update_session(session, thread_id=None, run_id=None, model=None, status=None, snapshot_hash=None, payload=None):
+def update_session(
+    session,
+    thread_id=None,
+    run_id=None,
+    model=None,
+    status=None,
+    snapshot_hash=None,
+    previous_response_id=None,
+    last_phase=None,
+    payload=None,
+):
     if session is None:
         return
     if thread_id is not None:
@@ -179,6 +191,10 @@ def update_session(session, thread_id=None, run_id=None, model=None, status=None
         session.LastStatus = status
     if snapshot_hash is not None:
         session.LastSnapshotHash = snapshot_hash
+    if previous_response_id is not None:
+        session.PreviousResponseId = previous_response_id
+    if last_phase is not None:
+        session.LastPhase = last_phase
     session.LastUpdatedUtc = _utc_now()
     if payload is not None:
         session.Payload = json.dumps(payload, sort_keys=True)

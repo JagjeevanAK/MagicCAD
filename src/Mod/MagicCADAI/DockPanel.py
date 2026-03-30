@@ -135,9 +135,11 @@ class MagicCADAIWidget(QtWidgets.QWidget):
 
         report_buttons = QtWidgets.QHBoxLayout()
         self.apply_button = QtWidgets.QPushButton("Apply Draft")
+        self.revise_button = QtWidgets.QPushButton("Revise Draft")
         self.reject_button = QtWidgets.QPushButton("Reject Draft")
         self.export_button = QtWidgets.QPushButton("Export Report")
         report_buttons.addWidget(self.apply_button)
+        report_buttons.addWidget(self.revise_button)
         report_buttons.addWidget(self.reject_button)
         report_buttons.addWidget(self.export_button)
         tab_layout.addLayout(report_buttons)
@@ -207,8 +209,9 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         else:
             self.report_browser.setPlainText(report.get("markdown", ""))
 
-    def set_draft_state(self, can_apply, can_reject):
+    def set_draft_state(self, can_apply, can_revise, can_reject):
         self.apply_button.setEnabled(bool(can_apply))
+        self.revise_button.setEnabled(bool(can_revise))
         self.reject_button.setEnabled(bool(can_reject))
 
 
@@ -295,6 +298,7 @@ class MagicCADAIController(QtCore.QObject):
 
         request = {
             "thread_id": getattr(session, "ThreadId", ""),
+            "previous_response_id": getattr(session, "PreviousResponseId", ""),
             "snapshot": snapshot,
             "intent": intent,
             "prompt": prompt,
@@ -322,7 +326,7 @@ class MagicCADAIController(QtCore.QObject):
             self._widget.append_transcript(
                 "Started {0} run {1} on {2}".format(intent, response.get("run_id", ""), document.Label)
             )
-        self._widget.set_draft_state(False, False)
+        self._widget.set_draft_state(False, False, False)
         self._set_status("MagicCAD AI run in progress...")
 
     def run_copilot(self):
@@ -347,27 +351,22 @@ class MagicCADAIController(QtCore.QObject):
             self._set_status("Approval sent to sidecar. Waiting for local tool request...")
             return
 
-        if not self._last_report or not self._last_report.get("proposed_changes"):
-            self._set_status("No draft is ready to apply")
-            return
+        self._set_status("No live draft approval is pending. Run the copilot again to apply a draft.")
 
-        question = QtWidgets.QMessageBox.question(
-            self._dock,
-            "Apply Draft",
-            "Apply the latest proposed change directly to the document?",
-            QtCompat.standard_button_value("Yes") | QtCompat.standard_button_value("No"),
+    def revise_pending_draft(self):
+        if not self._pending_approval:
+            self._set_status("No pending draft to revise")
+            return
+        feedback = self._widget.current_prompt().strip()
+        if not feedback:
+            self._set_status("Enter revision feedback in the copilot box before revising the draft")
+            return
+        self._bridge.resume_run(
+            self._pending_approval.get("run_id", ""),
+            "edit",
+            {"feedback": feedback},
         )
-        if question != QtCompat.standard_button_value("Yes"):
-            return
-
-        result = ToolRegistry.apply_ops(self._last_report["proposed_changes"][0].get("ops", []), document=document)
-        if result.get("ok", False):
-            self._auto_validation_hold_until = time.time() + 2.0
-            self._widget.append_transcript("Applied the latest proposed change locally.")
-            self.validate_document(document=document, selection_only=False, intent="validate", prompt="", auto=True)
-        else:
-            self._widget.append_transcript("Draft application failed: {0}".format(result.get("error", "")))
-            self._set_status("Draft application failed")
+        self._set_status("Revision feedback sent to the sidecar")
 
     def reject_pending_draft(self):
         if not self._pending_approval:
@@ -426,11 +425,12 @@ class MagicCADAIController(QtCore.QObject):
         self._widget.highlight_issue_button.clicked.connect(self.highlight_current_issue)
         self._widget.clear_highlight_button.clicked.connect(self.clear_highlight)
         self._widget.apply_button.clicked.connect(self.apply_pending_draft)
+        self._widget.revise_button.clicked.connect(self.revise_pending_draft)
         self._widget.reject_button.clicked.connect(self.reject_pending_draft)
         self._widget.export_button.clicked.connect(self.export_report)
         self._widget.issue_list.currentRowChanged.connect(lambda _row: self._widget.show_issue_details(self._widget.current_issue()))
         self._widget.issue_list.itemDoubleClicked.connect(lambda _item: self.highlight_current_issue())
-        self._widget.set_draft_state(False, False)
+        self._widget.set_draft_state(False, False, False)
 
         self._dock = QtWidgets.QDockWidget("MagicCAD AI")
         self._dock.setObjectName("MagicCADAIDock")
@@ -469,7 +469,7 @@ class MagicCADAIController(QtCore.QObject):
             self._widget.tabs.setCurrentIndex(1 if issues else 0)
         elif event_name == "approval_required":
             self._pending_approval = event
-            self._widget.set_draft_state(True, True)
+            self._widget.set_draft_state(True, True, True)
             self._widget.append_transcript(event.get("message", "Approval is required before applying the proposed change."))
             self._widget.tabs.setCurrentIndex(2)
         elif event_name == "tool_request":
@@ -500,10 +500,13 @@ class MagicCADAIController(QtCore.QObject):
                     thread_id=report.get("thread_id", ""),
                     status="report_ready",
                     snapshot_hash=report.get("snapshot_hash", ""),
+                    previous_response_id=report.get("previous_response_id", ""),
+                    last_phase=report.get("assistant_phase", ""),
                 )
             self._widget.set_report(report)
             self._widget.tabs.setCurrentIndex(2)
-            self._widget.set_draft_state(bool(report.get("proposed_changes")), bool(self._pending_approval))
+            has_pending = bool(self._pending_approval)
+            self._widget.set_draft_state(has_pending, has_pending, has_pending)
         elif event_name == "run_error":
             self._widget.append_transcript("Run error: {0}".format(event.get("message", "")))
             if session is not None:
@@ -516,7 +519,7 @@ class MagicCADAIController(QtCore.QObject):
                 SessionObjects.update_session(session, status=finished_status)
             if finished_status != "awaiting_approval":
                 self._pending_approval = None
-                self._widget.set_draft_state(bool(self._last_report and self._last_report.get("proposed_changes")), False)
+                self._widget.set_draft_state(False, False, False)
 
     def _set_status(self, text):
         if self._widget is not None:

@@ -155,6 +155,9 @@ pthreads-win32 = "*"
 
 [pypi-dependencies]
 freecad-stubs = "*"
+openai = "*"
+langgraph = "*"
+langgraph-checkpoint-sqlite = "*"
 
 ## Qt 6 Configuration Presets
 [target.linux-64.tasks]

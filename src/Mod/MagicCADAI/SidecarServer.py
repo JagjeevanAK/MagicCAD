@@ -5,7 +5,6 @@ import datetime
 import html as html_lib
 import json
 import os
-import queue
 import re
 import sqlite3
 import threading
@@ -20,9 +19,47 @@ import Validators
 DEFAULT_MODEL = "gpt-5.4"
 RULEPACK_VERSION = "v1"
 
+READ_ONLY_TOOL_SPECS = [
+    {
+        "type": "function",
+        "name": "get_document_snapshot",
+        "description": "Request a fresh read-only document snapshot from the desktop module.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selection_only": {
+                    "type": "boolean",
+                    "description": "When true, only request the current selection neighborhood.",
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_object_details",
+        "description": "Request read-only details for a specific object already present in the snapshot.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "object_name": {
+                    "type": "string",
+                    "description": "The internal FreeCAD object name.",
+                }
+            },
+            "required": ["object_name"],
+            "additionalProperties": False,
+        },
+    },
+]
+
 
 def utc_now():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _json_dumps(value):
+    return json.dumps(value, sort_keys=True)
 
 
 class SQLiteRunStore:
@@ -39,6 +76,7 @@ class SQLiteRunStore:
                 run_id text primary key,
                 thread_id text not null,
                 status text not null,
+                request_json text not null default '{}',
                 state_json text not null,
                 report_json text,
                 created_at text not null,
@@ -46,17 +84,28 @@ class SQLiteRunStore:
             )
             """
         )
+        self._ensure_column("request_json", "text not null default '{}'")
         self._db.commit()
+
+    @property
+    def path(self):
+        return self._path
+
+    def _ensure_column(self, name, definition):
+        columns = {row[1] for row in self._db.execute("pragma table_info(runs)")}
+        if name not in columns:
+            self._db.execute("alter table runs add column {0} {1}".format(name, definition))
 
     def save_run(self, run):
         with self._lock:
             self._db.execute(
                 """
-                insert into runs(run_id, thread_id, status, state_json, report_json, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?)
+                insert into runs(run_id, thread_id, status, request_json, state_json, report_json, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(run_id) do update set
                     thread_id=excluded.thread_id,
                     status=excluded.status,
+                    request_json=excluded.request_json,
                     state_json=excluded.state_json,
                     report_json=excluded.report_json,
                     updated_at=excluded.updated_at
@@ -65,24 +114,70 @@ class SQLiteRunStore:
                     run.run_id,
                     run.thread_id,
                     run.status,
-                    json.dumps(run.state, sort_keys=True),
-                    json.dumps(run.state.get("report", {}), sort_keys=True),
+                    _json_dumps(run.request),
+                    _json_dumps(run.state),
+                    _json_dumps(run.state.get("report", {})),
                     run.created_at,
                     run.updated_at,
                 ),
             )
             self._db.commit()
 
+    def load_run(self, run_id):
+        with self._lock:
+            row = self._db.execute(
+                """
+                select run_id, thread_id, status, request_json, state_json, created_at, updated_at
+                from runs where run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        request = _safe_json_loads(row[3], {})
+        state = _safe_json_loads(row[4], {})
+        return RunRecord(
+            request=request,
+            run_id=row[0],
+            thread_id=row[1],
+            status=row[2],
+            state=state,
+            created_at=row[5],
+            updated_at=row[6],
+        )
+
 
 class RunRecord:
-    def __init__(self, request):
-        self.run_id = uuid.uuid4().hex
-        self.thread_id = request.get("thread_id") or uuid.uuid4().hex
-        self.status = "queued"
-        self.created_at = utc_now()
-        self.updated_at = self.created_at
-        self.request = request
-        self.state = {
+    def __init__(
+        self,
+        request,
+        run_id=None,
+        thread_id=None,
+        status="queued",
+        state=None,
+        created_at=None,
+        updated_at=None,
+    ):
+        self.run_id = run_id or uuid.uuid4().hex
+        self.thread_id = thread_id or request.get("thread_id") or uuid.uuid4().hex
+        self.status = status
+        self.created_at = created_at or utc_now()
+        self.updated_at = updated_at or self.created_at
+        self.request = dict(request or {})
+        self.state = state or self._build_initial_state(self.request)
+        self.state.setdefault("run_id", self.run_id)
+        self.state.setdefault("thread_id", self.thread_id)
+        self.events = []
+        self.condition = threading.Condition()
+        self.terminal = self.status in ("completed", "error")
+        self.approval_event = threading.Event()
+        self.tool_result_event = threading.Event()
+        self.pending_decision = None
+        self.pending_decision_payload = {}
+        self.pending_tool_result = None
+
+    def _build_initial_state(self, request):
+        return {
             "run_id": self.run_id,
             "thread_id": self.thread_id,
             "model": request.get("model", DEFAULT_MODEL),
@@ -91,20 +186,19 @@ class RunRecord:
             "selection_only": bool(request.get("selection_only", False)),
             "snapshot": request.get("snapshot", {}),
             "issues": [],
+            "issue_counts": {"total": 0},
             "assistant_text": "",
+            "assistant_phase": "",
+            "previous_response_id": request.get("previous_response_id", ""),
             "proposed_changes": [],
+            "approval_status": "not_required",
+            "approval_feedback": "",
+            "pending_tool_request": None,
+            "tool_return_to": "",
             "tool_results": [],
             "report": {},
-            "approval_status": "not_required",
+            "error": "",
         }
-        self.events = []
-        self.condition = threading.Condition()
-        self.terminal = False
-        self.approval_event = threading.Event()
-        self.tool_result_event = threading.Event()
-        self.pending_decision = None
-        self.pending_decision_payload = {}
-        self.pending_tool_result = None
 
     def publish(self, event_name, **payload):
         event = {
@@ -150,7 +244,11 @@ class PromptInterpreter:
         revised = json.loads(json.dumps(proposed_changes))
         op = revised[0].get("ops", [{}])[0]
         teeth = cls._extract_number(feedback, r"(\d+)\s*teeth?", int(op.get("number_of_teeth", 10)))
-        module = cls._extract_number(feedback, r"module\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)", float(op.get("module", 2.0)))
+        module = cls._extract_number(
+            feedback,
+            r"module\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)",
+            float(op.get("module", 2.0)),
+        )
         pressure_angle = cls._extract_number(
             feedback,
             r"pressure angle\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)",
@@ -188,7 +286,9 @@ class PromptInterpreter:
             "pressure_angle": float(
                 cls._extract_number(prompt, r"pressure angle\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)", 20.0)
             ),
-            "thickness": float(cls._extract_number(prompt, r"(?:thickness|height)\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)", 8.0)),
+            "thickness": float(
+                cls._extract_number(prompt, r"(?:thickness|height)\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)", 8.0)
+            ),
             "center_bore": float(
                 cls._extract_number(prompt, r"(?:bore|hole|center bore)\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)", 6.0)
             ),
@@ -252,74 +352,193 @@ class OpenAIResponder:
     def available(self):
         return self._client is not None
 
-    def summarize(self, snapshot, issues, prompt, model):
+    @property
+    def last_error(self):
+        return self._error
+
+    def explain(self, state):
         if not self.available:
-            return ""
+            return {"assistant_text": "", "assistant_phase": state.get("assistant_phase", ""), "previous_response_id": state.get("previous_response_id", "")}
+
+        snapshot = state.get("snapshot", {})
+        issues = state.get("issues", [])
+        prompt = state.get("prompt", "")
+        model = state.get("model", DEFAULT_MODEL)
+        phase = state.get("assistant_phase", "") or ("copilot" if prompt else "validate")
         payload = {
+            "phase": phase,
+            "intent": state.get("intent", "validate"),
             "prompt": prompt,
             "issue_count": len(issues),
             "issues": issues[:10],
             "objects": snapshot.get("objects", [])[:20],
-            "selection_only": snapshot.get("selection", []),
+            "selection": snapshot.get("selection", []),
+            "tool_results": state.get("tool_results", [])[-3:],
         }
         system_prompt = (
             "You are MagicCAD AI. Provide concise, actionable CAD review feedback for a FreeCAD-based desktop tool. "
-            "If a change request is present, describe the expected draft in plain language and mention important risks."
+            "If you need more detail, call a read-only tool. Never ask to run arbitrary Python. "
+            "When you answer directly, return clear prose only."
         )
+        kwargs = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload)}]},
+            ],
+            "tools": READ_ONLY_TOOL_SPECS,
+        }
+        previous_response_id = state.get("previous_response_id", "")
+        if previous_response_id:
+            kwargs["previous_response_id"] = previous_response_id
         try:
-            response = self._client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload)}]},
-                ],
-            )
-            text = getattr(response, "output_text", "")
-            if text:
-                return text.strip()
-            for item in getattr(response, "output", []):
-                for content in getattr(item, "content", []):
-                    if getattr(content, "type", "") == "output_text":
-                        return getattr(content, "text", "").strip()
+            response = self._client.responses.create(**kwargs)
+            parsed = self._parse_response(response)
+            parsed.setdefault("assistant_phase", phase)
+            return parsed
         except Exception as exc:
             self._error = str(exc)
-        return ""
+            return {"assistant_text": "", "assistant_phase": phase, "previous_response_id": previous_response_id}
+
+    def _parse_response(self, response):
+        text = getattr(response, "output_text", "") or ""
+        tool_request = None
+        for item in getattr(response, "output", []) or []:
+            item_type = _field(item, "type")
+            if item_type == "function_call":
+                arguments = _safe_json_loads(_field(item, "arguments", "{}"), {})
+                tool_request = {
+                    "request_id": uuid.uuid4().hex,
+                    "call_id": _field(item, "call_id", ""),
+                    "tool_name": _field(item, "name", ""),
+                    "arguments": arguments,
+                }
+                break
+            if item_type == "message":
+                for content in _field(item, "content", []) or []:
+                    if _field(content, "type") == "output_text":
+                        text = text or _field(content, "text", "")
+        payload = {
+            "assistant_text": (text or "").strip(),
+            "assistant_phase": "",
+            "previous_response_id": _field(response, "id", ""),
+        }
+        if tool_request:
+            payload["pending_tool_request"] = tool_request
+            payload["tool_return_to"] = "llm_explain"
+        return payload
 
 
-class LangGraphAdapter:
-    def __init__(self, engine):
+class LangGraphRuntime:
+    def __init__(self, engine, database_path):
         self._engine = engine
         self.available = False
+        self.error = ""
         self._compiled = None
+        self._command_cls = None
+        self._interrupt_fn = None
+        self._checkpointer = None
         try:
-            from langgraph.graph import END, StateGraph
-        except Exception:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+            from langgraph.graph import END, START, StateGraph
+            from langgraph.types import Command, interrupt
+        except Exception as exc:
+            self.error = str(exc)
             return
-        try:
-            graph = StateGraph(dict)
-            graph.add_node("intake", self._wrap("intake", engine.intake))
-            graph.add_node("normalize_snapshot", self._wrap("normalize_snapshot", engine.normalize_snapshot))
-            graph.add_node("deterministic_validate", self._wrap("deterministic_validate", engine.deterministic_validate))
-            graph.add_node("llm_explain", self._wrap("llm_explain", engine.llm_explain))
-            graph.add_node("draft_plan", self._wrap("draft_plan", engine.draft_plan))
-            graph.add_node("report_render", self._wrap("report_render", engine.report_render))
-            graph.set_entry_point("intake")
-            graph.add_edge("intake", "normalize_snapshot")
-            graph.add_edge("normalize_snapshot", "deterministic_validate")
-            graph.add_edge("deterministic_validate", "llm_explain")
-            graph.add_edge("llm_explain", "draft_plan")
-            graph.add_edge("draft_plan", "report_render")
-            graph.add_edge("report_render", END)
-            self._compiled = graph.compile()
-            self.available = True
-        except Exception:
-            self._compiled = None
-            self.available = False
 
-    def run(self, state):
+        try:
+            self._checkpointer = SqliteSaver.from_conn_string(database_path)
+        except Exception:
+            try:
+                self._checkpointer = SqliteSaver(sqlite3.connect(database_path, check_same_thread=False))
+            except Exception as exc:
+                self.error = str(exc)
+                return
+
+        graph = StateGraph(dict)
+        graph.add_node("intake", self._wrap("intake", engine.intake))
+        graph.add_node("normalize_snapshot", self._wrap("normalize_snapshot", engine.normalize_snapshot))
+        graph.add_node("deterministic_validate", self._wrap("deterministic_validate", engine.deterministic_validate))
+        graph.add_node("llm_explain", self._wrap("llm_explain", engine.llm_explain))
+        graph.add_node("draft_plan", self._wrap("draft_plan", engine.draft_plan))
+        graph.add_node("approval_gate", self._wrap("approval_gate", engine.approval_gate))
+        graph.add_node("tool_dispatch", self._wrap("tool_dispatch", engine.tool_dispatch))
+        graph.add_node("report_render", self._wrap("report_render", engine.report_render))
+        graph.add_node("complete", self._wrap("complete", engine.complete))
+        graph.add_edge(START, "intake")
+        graph.add_edge("intake", "normalize_snapshot")
+        graph.add_edge("normalize_snapshot", "deterministic_validate")
+        graph.add_edge("deterministic_validate", "llm_explain")
+        graph.add_conditional_edges(
+            "llm_explain",
+            self._engine.route_after_llm_explain,
+            {"draft_plan": "draft_plan", "tool_dispatch": "tool_dispatch"},
+        )
+        graph.add_conditional_edges(
+            "draft_plan",
+            self._engine.route_after_draft_plan,
+            {
+                "approval_gate": "approval_gate",
+                "tool_dispatch": "tool_dispatch",
+                "report_render": "report_render",
+            },
+        )
+        graph.add_conditional_edges(
+            "approval_gate",
+            self._engine.route_after_approval_gate,
+            {
+                "draft_plan": "draft_plan",
+                "tool_dispatch": "tool_dispatch",
+                "report_render": "report_render",
+            },
+        )
+        graph.add_conditional_edges(
+            "tool_dispatch",
+            self._engine.route_after_tool_dispatch,
+            {
+                "llm_explain": "llm_explain",
+                "draft_plan": "draft_plan",
+                "report_render": "report_render",
+            },
+        )
+        graph.add_edge("report_render", "complete")
+        graph.add_edge("complete", END)
+
+        try:
+            self._compiled = graph.compile(checkpointer=self._checkpointer)
+            self._command_cls = Command
+            self._interrupt_fn = interrupt
+            self.available = True
+        except Exception as exc:
+            self.error = str(exc)
+            self._compiled = None
+
+    def interrupt(self, payload):
+        if not self.available or self._interrupt_fn is None:
+            raise RuntimeError("LangGraph interrupt is not available")
+        return self._interrupt_fn(payload)
+
+    def initial_invoke(self, state, config):
         if not self.available or self._compiled is None:
             return state
-        return self._compiled.invoke(state)
+        return self._compiled.invoke(state, config=config)
+
+    def resume_invoke(self, resume_payload, config):
+        if not self.available or self._compiled is None or self._command_cls is None:
+            return resume_payload
+        return self._compiled.invoke(self._command_cls(resume=resume_payload), config=config)
+
+    def current_state(self, config, fallback):
+        if not self.available or self._compiled is None:
+            return fallback
+        try:
+            snapshot = self._compiled.get_state(config)
+            values = getattr(snapshot, "values", None)
+            if isinstance(values, dict):
+                return values
+        except Exception:
+            pass
+        return fallback
 
     def _wrap(self, node_name, fn):
         def wrapper(state):
@@ -336,15 +555,274 @@ class MagicCADAgentEngine:
         self._store = store
         self._llm = OpenAIResponder()
         self._local = threading.local()
-        self._langgraph = LangGraphAdapter(self)
+        self._langgraph = LangGraphRuntime(self, self._store.path)
 
-    def process_run(self, run):
+    @property
+    def langgraph_available(self):
+        return self._langgraph.available
+
+    @property
+    def current_run(self):
+        return getattr(self._local, "run", None)
+
+    def start_run(self, run):
+        if self._langgraph.available:
+            self._drive_graph(run, mode="start")
+            return
+        self._process_without_langgraph(run)
+
+    def resume_approval(self, run, decision, payload):
+        if self._langgraph.available:
+            self._drive_graph(run, mode="resume", resume_payload={"decision": decision, "payload": payload or {}})
+            return
+        run.pending_decision = decision
+        run.pending_decision_payload = payload or {}
+        run.approval_event.set()
+        self._persist(run)
+
+    def resume_tool(self, run, payload):
+        if self._langgraph.available:
+            self._drive_graph(run, mode="tool", resume_payload=payload or {})
+            return
+        run.pending_tool_result = payload or {}
+        run.tool_result_event.set()
+        self._persist(run)
+
+    def publish_node(self, node_name, status):
+        run = self.current_run
+        if run is not None:
+            self._publish(run, "node_status", node=node_name, status=status)
+
+    def intake(self, state):
+        summary = "Intake complete for {0} objects.".format(len(state.get("snapshot", {}).get("objects", [])))
+        return {"assistant_phase": "intake", "summary": summary}
+
+    def normalize_snapshot(self, state):
+        snapshot = dict(state.get("snapshot", {}) or {})
+        snapshot.setdefault("objects", [])
+        snapshot.setdefault("selection", [])
+        snapshot.setdefault("dependency_edges", [])
+        snapshot.setdefault("recompute_errors", [])
+        return {"assistant_phase": "normalize_snapshot", "snapshot": snapshot}
+
+    def deterministic_validate(self, state):
+        issues = Validators.validate_snapshot(state.get("snapshot", {}))
+        run = self.current_run
+        if run is not None:
+            self._publish(run, "issues_delta", issues=issues)
+        return {
+            "assistant_phase": "deterministic_validate",
+            "issues": issues,
+            "issue_counts": Validators.issue_counts(issues),
+        }
+
+    def llm_explain(self, state):
+        explanation = self._llm.explain(state)
+        text = explanation.get("assistant_text", "")
+        if not text:
+            text = self._fallback_explanation(state.get("snapshot", {}), state.get("issues", []), state.get("prompt", ""))
+        run = self.current_run
+        if run is not None and text:
+            self._publish(run, "assistant_delta", text=text, phase=explanation.get("assistant_phase", "llm_explain"))
+        updates = {
+            "assistant_phase": explanation.get("assistant_phase", "llm_explain") or "llm_explain",
+            "assistant_text": text,
+            "previous_response_id": explanation.get("previous_response_id", state.get("previous_response_id", "")),
+            "pending_tool_request": explanation.get("pending_tool_request"),
+            "tool_return_to": explanation.get("tool_return_to", ""),
+            "backend": {
+                "openai": self._llm.available,
+                "langgraph": self._langgraph.available,
+                "model": state.get("model", DEFAULT_MODEL),
+            },
+        }
+        return updates
+
+    def draft_plan(self, state):
+        feedback = (state.get("approval_feedback", "") or "").strip()
+        proposed_changes = state.get("proposed_changes", [])
+        if feedback and proposed_changes:
+            changes = PromptInterpreter.revise_changes(proposed_changes, feedback)
+        else:
+            changes = PromptInterpreter.plan_changes(
+                state.get("snapshot", {}),
+                state.get("prompt", ""),
+                state.get("issues", []),
+            )
+        return {
+            "assistant_phase": "draft_plan",
+            "proposed_changes": changes,
+            "approval_status": "required" if changes else "not_required",
+            "approval_feedback": "",
+        }
+
+    def approval_gate(self, state):
+        proposed_changes = state.get("proposed_changes", [])
+        if not proposed_changes:
+            return {"approval_status": "not_required"}
+
+        run = self.current_run
+        if run is None:
+            return {"approval_status": "rejected"}
+
+        self._set_status(run, "awaiting_approval")
+        request = {
+            "interrupt_kind": "approval",
+            "message": "Approval is required before MagicCAD AI applies local document changes.",
+            "proposed_changes": proposed_changes,
+        }
+        self._publish(run, "approval_required", **request)
+        decision_payload = self._langgraph.interrupt(request)
+        self._set_status(run, "running")
+
+        decision = _field(decision_payload, "decision", "reject")
+        payload = _field(decision_payload, "payload", {}) or {}
+        if decision == "edit":
+            feedback = payload.get("feedback", "")
+            self._publish(run, "assistant_delta", text="Revising the proposed draft based on the latest feedback.", phase="approval")
+            return {
+                "approval_status": "edited",
+                "approval_feedback": feedback,
+            }
+        if decision == "approve":
+            selected = self._select_change(proposed_changes, payload.get("change_id", ""))
+            request_id = uuid.uuid4().hex
+            return {
+                "approval_status": "approved",
+                "applied_change": selected,
+                "pending_tool_request": {
+                    "request_id": request_id,
+                    "tool_name": "apply_ops",
+                    "arguments": {"ops": selected.get("ops", [])},
+                    "interrupt_kind": "tool",
+                },
+                "tool_return_to": "report_render",
+            }
+        return {"approval_status": "rejected"}
+
+    def tool_dispatch(self, state):
+        tool_request = state.get("pending_tool_request")
+        if not tool_request:
+            return {"tool_return_to": ""}
+
+        run = self.current_run
+        if run is None:
+            return {
+                "pending_tool_request": None,
+                "tool_return_to": "",
+                "tool_results": list(state.get("tool_results", [])),
+            }
+
+        request = dict(tool_request)
+        request.setdefault("interrupt_kind", "tool")
+        self._set_status(run, "awaiting_tool")
+        self._publish(run, "tool_request", **request, return_node=state.get("tool_return_to", ""))
+        tool_result = self._langgraph.interrupt(request)
+        self._set_status(run, "running")
+
+        collected = list(state.get("tool_results", []))
+        collected.append(tool_result or {"result": {"ok": False, "error": "No tool result received"}})
+        result_ok = _field(_field(tool_result, "result", {}), "ok", False)
+        if request.get("tool_name") == "apply_ops":
+            if result_ok:
+                self._publish(run, "assistant_delta", text="Approved change applied locally and recomputed.", phase="tool")
+            else:
+                self._publish(
+                    run,
+                    "assistant_delta",
+                    text="Approved change failed locally: {0}".format(_field(_field(tool_result, "result", {}), "error", "unknown error")),
+                    phase="tool",
+                )
+        return {
+            "pending_tool_request": None,
+            "tool_results": collected,
+        }
+
+    def report_render(self, state):
+        return {
+            "assistant_phase": "report_render",
+            "report": self._render_report(state),
+        }
+
+    def complete(self, state):
+        return {"assistant_phase": "complete"}
+
+    def route_after_llm_explain(self, state):
+        return "tool_dispatch" if state.get("pending_tool_request") else "draft_plan"
+
+    def route_after_draft_plan(self, state):
+        if state.get("pending_tool_request"):
+            return "tool_dispatch"
+        if state.get("proposed_changes"):
+            return "approval_gate"
+        return "report_render"
+
+    def route_after_approval_gate(self, state):
+        if state.get("approval_status") == "edited":
+            return "draft_plan"
+        if state.get("pending_tool_request"):
+            return "tool_dispatch"
+        return "report_render"
+
+    def route_after_tool_dispatch(self, state):
+        return state.get("tool_return_to", "") or "report_render"
+
+    def _drive_graph(self, run, mode, resume_payload=None):
+        self._local.run = run
+        try:
+            config = {"configurable": {"thread_id": run.thread_id}}
+            if mode == "start":
+                run.status = "running"
+                self._persist(run)
+                self._publish(run, "run_started", status="running")
+                result = self._langgraph.initial_invoke(dict(run.state), config)
+            else:
+                run.status = "running"
+                self._persist(run)
+                result = self._langgraph.resume_invoke(resume_payload or {}, config)
+
+            graph_state = self._langgraph.current_state(config, result if isinstance(result, dict) else run.state)
+            if isinstance(graph_state, dict):
+                run.state.update(graph_state)
+            self._persist(run)
+            if run.status in ("awaiting_approval", "awaiting_tool"):
+                return
+            run.state["report"] = run.state.get("report") or self._render_report(run.state)
+            self._persist(run)
+            self._publish(run, "report_ready", report=run.state["report"])
+            run.status = "completed"
+            self._persist(run)
+            self._publish(run, "run_finished", status="completed")
+            run.close("completed")
+            self._persist(run)
+        except Exception as exc:
+            run.status = "error"
+            run.state["error"] = str(exc)
+            self._persist(run)
+            self._publish(run, "run_error", message=str(exc), traceback=traceback.format_exc())
+            self._publish(run, "run_finished", status="error")
+            run.close("error")
+            self._persist(run)
+        finally:
+            self._local.run = None
+
+    def _process_without_langgraph(self, run):
         self._local.run = run
         try:
             run.status = "running"
             self._persist(run)
             self._publish(run, "run_started", status="running")
-            state = self._execute_pipeline(run)
+            state = dict(run.state)
+            for node_name, fn in (
+                ("intake", self.intake),
+                ("normalize_snapshot", self.normalize_snapshot),
+                ("deterministic_validate", self.deterministic_validate),
+                ("llm_explain", self.llm_explain),
+                ("draft_plan", self.draft_plan),
+            ):
+                self.publish_node(node_name, "running")
+                state.update(fn(state))
+                self.publish_node(node_name, "completed")
             run.state.update(state)
             if run.state.get("proposed_changes"):
                 run.state = self._approval_loop(run, run.state)
@@ -367,151 +845,72 @@ class MagicCADAgentEngine:
         finally:
             self._local.run = None
 
-    def publish_node(self, node_name, status):
-        run = getattr(self._local, "run", None)
-        if run is not None:
-            self._publish(run, "node_status", node=node_name, status=status)
-
-    def intake(self, state):
-        summary = "Intake complete for {0} objects.".format(len(state.get("snapshot", {}).get("objects", [])))
-        return {"phase": "intake", "summary": summary}
-
-    def normalize_snapshot(self, state):
-        snapshot = state.get("snapshot", {})
-        normalized = dict(snapshot)
-        normalized.setdefault("objects", [])
-        normalized.setdefault("selection", [])
-        normalized.setdefault("dependency_edges", [])
-        normalized.setdefault("recompute_errors", [])
-        return {"phase": "normalize_snapshot", "snapshot": normalized}
-
-    def deterministic_validate(self, state):
-        issues = Validators.validate_snapshot(state.get("snapshot", {}))
-        run = getattr(self._local, "run", None)
-        if run is not None:
-            self._publish(run, "issues_delta", issues=issues)
-        return {
-            "phase": "deterministic_validate",
-            "issues": issues,
-            "issue_counts": Validators.issue_counts(issues),
-        }
-
-    def llm_explain(self, state):
-        snapshot = state.get("snapshot", {})
-        issues = state.get("issues", [])
-        prompt = state.get("prompt", "")
-        model = state.get("model", DEFAULT_MODEL)
-        explanation = self._llm.summarize(snapshot, issues, prompt, model)
-        if not explanation:
-            explanation = self._fallback_explanation(snapshot, issues, prompt)
-        run = getattr(self._local, "run", None)
-        if run is not None:
-            self._publish(run, "assistant_delta", text=explanation)
-        return {
-            "phase": "llm_explain",
-            "assistant_text": explanation,
-            "backend": {
-                "openai": self._llm.available,
-                "langgraph": self._langgraph.available,
-                "model": model,
-            },
-        }
-
-    def draft_plan(self, state):
-        changes = PromptInterpreter.plan_changes(
-            state.get("snapshot", {}),
-            state.get("prompt", ""),
-            state.get("issues", []),
-        )
-        return {
-            "phase": "draft_plan",
-            "proposed_changes": changes,
-            "approval_status": "required" if changes else "not_required",
-        }
-
-    def report_render(self, state):
-        return {
-            "phase": "report_render",
-            "report": self._render_report(state),
-        }
-
-    def _execute_pipeline(self, run):
-        state = dict(run.state)
-        if self._langgraph.available:
-            result = self._langgraph.run(state)
-            return result if isinstance(result, dict) else state
-
-        for node_name, fn in (
-            ("intake", self.intake),
-            ("normalize_snapshot", self.normalize_snapshot),
-            ("deterministic_validate", self.deterministic_validate),
-            ("llm_explain", self.llm_explain),
-            ("draft_plan", self.draft_plan),
-            ("report_render", self.report_render),
-        ):
-            self.publish_node(node_name, "running")
-            state.update(fn(state))
-            self.publish_node(node_name, "completed")
-        return state
-
     def _approval_loop(self, run, state):
-        proposed_changes = state.get("proposed_changes", [])
+        proposed_changes = list(state.get("proposed_changes", []))
         while proposed_changes:
-            run.status = "awaiting_approval"
-            self._persist(run)
+            self._set_status(run, "awaiting_approval")
             run.approval_event.clear()
             self._publish(
                 run,
                 "approval_required",
                 proposed_changes=proposed_changes,
                 message="Approval is required before MagicCAD AI applies local document changes.",
+                interrupt_kind="approval",
             )
             run.approval_event.wait()
             decision = run.pending_decision or "reject"
             payload = run.pending_decision_payload or {}
             run.pending_decision = None
             run.pending_decision_payload = {}
-            run.status = "running"
-            self._persist(run)
+            self._set_status(run, "running")
 
             if decision == "reject":
                 state["approval_status"] = "rejected"
+                state["proposed_changes"] = proposed_changes
                 return state
             if decision == "edit":
                 proposed_changes = PromptInterpreter.revise_changes(proposed_changes, payload.get("feedback", ""))
                 state["proposed_changes"] = proposed_changes
                 state["approval_status"] = "edited"
-                self._publish(run, "assistant_delta", text="Revised the proposed draft based on the edit feedback.")
+                self._publish(run, "assistant_delta", text="Revised the proposed draft based on the latest feedback.", phase="approval")
                 continue
 
-            change_id = payload.get("change_id", "")
-            selected = self._select_change(proposed_changes, change_id)
+            selected = self._select_change(proposed_changes, payload.get("change_id", ""))
             request_id = uuid.uuid4().hex
-            tool_request = {
-                "request_id": request_id,
-                "tool_name": "apply_ops",
-                "arguments": {"ops": selected.get("ops", [])},
-            }
             run.tool_result_event.clear()
-            self._publish(run, "tool_request", **tool_request)
+            self._set_status(run, "awaiting_tool")
+            self._publish(
+                run,
+                "tool_request",
+                request_id=request_id,
+                tool_name="apply_ops",
+                arguments={"ops": selected.get("ops", [])},
+                interrupt_kind="tool",
+                return_node="report_render",
+            )
             run.tool_result_event.wait()
             tool_result = run.pending_tool_result or {"result": {"ok": False, "error": "No tool result received"}}
             run.pending_tool_result = None
+            self._set_status(run, "running")
             state.setdefault("tool_results", []).append(tool_result)
-            state["approval_status"] = "approved" if tool_result.get("result", {}).get("ok") else "failed"
+            state["approval_status"] = "approved" if _field(_field(tool_result, "result", {}), "ok", False) else "failed"
             state["applied_change"] = selected
-            if tool_result.get("result", {}).get("ok"):
-                self._publish(run, "assistant_delta", text="Approved change applied locally and recomputed.")
+            state["proposed_changes"] = proposed_changes
+            if _field(_field(tool_result, "result", {}), "ok", False):
+                self._publish(run, "assistant_delta", text="Approved change applied locally and recomputed.", phase="tool")
             else:
                 self._publish(
                     run,
                     "assistant_delta",
-                    text="Approved change failed locally: {0}".format(tool_result.get("result", {}).get("error", "unknown error")),
+                    text="Approved change failed locally: {0}".format(_field(_field(tool_result, "result", {}), "error", "unknown error")),
+                    phase="tool",
                 )
             return state
         return state
 
     def _select_change(self, proposed_changes, change_id):
+        if not proposed_changes:
+            return {}
         if not change_id:
             return proposed_changes[0]
         for change in proposed_changes:
@@ -526,8 +925,7 @@ class MagicCADAgentEngine:
         if prompt:
             summary += " Request: {0}".format(prompt.strip())
         if issues:
-            top_issue = issues[0]
-            summary += " Highest priority: {0}".format(top_issue.get("message", ""))
+            summary += " Highest priority: {0}".format(issues[0].get("message", ""))
         else:
             summary += " No deterministic validation risks were detected."
         return summary
@@ -569,8 +967,9 @@ class MagicCADAgentEngine:
         if tool_results:
             markdown_lines.append("## Tool Results")
             for result in tool_results:
-                ok = result.get("result", {}).get("ok", False)
-                markdown_lines.append("- {0}".format("Applied successfully" if ok else result.get("result", {}).get("error", "Failed")))
+                ok = _field(_field(result, "result", {}), "ok", False)
+                message = "Applied successfully" if ok else _field(_field(result, "result", {}), "error", "Failed")
+                markdown_lines.append("- {0}".format(message))
             markdown_lines.append("")
 
         markdown = "\n".join(markdown_lines).strip() + "\n"
@@ -580,6 +979,8 @@ class MagicCADAgentEngine:
             "thread_id": state.get("thread_id", ""),
             "snapshot_hash": state.get("snapshot", {}).get("snapshot_hash", ""),
             "summary": summary,
+            "assistant_phase": state.get("assistant_phase", ""),
+            "previous_response_id": state.get("previous_response_id", ""),
             "issue_counts": counts,
             "issues": issues,
             "proposed_changes": proposed_changes,
@@ -587,6 +988,7 @@ class MagicCADAgentEngine:
                 "requested_model": state.get("model", DEFAULT_MODEL),
                 "openai_enabled": self._llm.available,
                 "langgraph_enabled": self._langgraph.available,
+                "langgraph_error": self._langgraph.error,
             },
             "rulepack_version": RULEPACK_VERSION,
             "created_at": utc_now(),
@@ -601,6 +1003,11 @@ class MagicCADAgentEngine:
     def _persist(self, run):
         self._store.save_run(run)
 
+    def _set_status(self, run, status):
+        run.status = status
+        run.updated_at = utc_now()
+        self._persist(run)
+
 
 class ServerState:
     def __init__(self, database_path):
@@ -610,38 +1017,48 @@ class ServerState:
         self._lock = threading.Lock()
 
     def health(self):
-        return {"ok": True, "status": "ready", "timestamp": utc_now()}
+        return {
+            "ok": True,
+            "status": "ready",
+            "timestamp": utc_now(),
+            "langgraph_enabled": self._engine.langgraph_available,
+        }
 
     def create_run(self, request):
         run = RunRecord(request)
         with self._lock:
             self._runs[run.run_id] = run
         self._store.save_run(run)
-        worker = threading.Thread(target=self._engine.process_run, args=(run,), daemon=True)
+        worker = threading.Thread(target=self._engine.start_run, args=(run,), daemon=True)
         worker.start()
         return run
 
     def get_run(self, run_id):
         with self._lock:
-            return self._runs.get(run_id)
+            run = self._runs.get(run_id)
+        if run is not None:
+            return run
+        restored = self._store.load_run(run_id)
+        if restored is None:
+            return None
+        with self._lock:
+            self._runs[run_id] = restored
+        return restored
 
     def resume_run(self, run_id, decision, payload):
         run = self.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        run.pending_decision = decision
-        run.pending_decision_payload = payload or {}
-        run.approval_event.set()
-        self._store.save_run(run)
+        worker = threading.Thread(target=self._engine.resume_approval, args=(run, decision, payload or {}), daemon=True)
+        worker.start()
         return {"ok": True, "run_id": run_id, "status": run.status}
 
     def submit_tool_results(self, run_id, payload):
         run = self.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        run.pending_tool_result = payload or {}
-        run.tool_result_event.set()
-        self._store.save_run(run)
+        worker = threading.Thread(target=self._engine.resume_tool, args=(run, payload or {}), daemon=True)
+        worker.start()
         return {"ok": True, "run_id": run_id}
 
 
@@ -745,6 +1162,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             return
+
+
+def _field(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _safe_json_loads(text, default):
+    try:
+        if isinstance(text, (dict, list)):
+            return text
+        if text is None:
+            return default
+        return json.loads(text)
+    except Exception:
+        return default
 
 
 def parse_args(argv=None):

@@ -39,10 +39,6 @@ Before testing, make sure:
 
 Optional AI setup:
 
-- install Python packages into the active environment if you want LLM-backed explanations:
-  ```bash
-  pixi run python -m pip install openai langgraph
-  ```
 - set an API key before launching FreeCAD:
   ```bash
   export OPENAI_API_KEY=your_key_here
@@ -50,6 +46,7 @@ Optional AI setup:
 
 Notes:
 
+- `openai` and LangGraph dependencies are expected to come from the repo-managed Pixi environment
 - the macOS Qt warning about `.AppleSystemUIFont` can be ignored unless UI text is broken
 - if OpenAI is not configured, deterministic validation should still work
 

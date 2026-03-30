@@ -130,7 +130,9 @@ class SidecarBridgeClient(QtCore.QObject):
 
     def submit_tool_results(self, run_id, payload):
         try:
-            return self._request("POST", "/v1/runs/{0}/tool-results".format(run_id), payload)
+            response = self._request("POST", "/v1/runs/{0}/tool-results".format(run_id), payload)
+            self._ensure_event_stream(run_id)
+            return response
         except Exception as exc:
             self.bridgeError.emit("tool_results", str(exc))
             return {"ok": False, "error": str(exc)}
@@ -138,7 +140,9 @@ class SidecarBridgeClient(QtCore.QObject):
     def resume_run(self, run_id, decision, payload=None):
         body = {"decision": decision, "payload": payload or {}}
         try:
-            return self._request("POST", "/v1/runs/{0}/resume".format(run_id), body)
+            response = self._request("POST", "/v1/runs/{0}/resume".format(run_id), body)
+            self._ensure_event_stream(run_id)
+            return response
         except Exception as exc:
             self.bridgeError.emit("resume_run", str(exc))
             return {"ok": False, "error": str(exc)}
@@ -216,6 +220,11 @@ class SidecarBridgeClient(QtCore.QObject):
         thread.streamFinished.connect(self._cleanup_thread)
         self._event_threads[run_id] = thread
         thread.start()
+
+    def _ensure_event_stream(self, run_id):
+        thread = self._event_threads.get(run_id)
+        if thread is None or thread.isFinished():
+            self._start_event_stream(run_id)
 
     def _cleanup_thread(self, run_id):
         thread = self._event_threads.pop(run_id, None)
