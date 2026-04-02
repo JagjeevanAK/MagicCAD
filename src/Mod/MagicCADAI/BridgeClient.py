@@ -182,6 +182,9 @@ class SidecarBridgeClient(QtCore.QObject):
             "--database",
             database_path,
         ]
+        # Inherit environment variables (including GEMINI_API_KEY, OPENAI_API_KEY)
+        env = QtCore.QProcess.systemEnvironment()
+        self._process.setEnvironment(env)
         self.statusChanged.emit("Starting MagicCAD AI sidecar...")
         self._process.start(python_exe, args)
 

@@ -21,7 +21,16 @@ QtCore = QtCompat.QtCore
 QtWidgets = QtCompat.QtWidgets
 Qt = QtCompat.Qt
 
-MODEL_OPTIONS = ("gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini")
+MODEL_OPTIONS = (
+    # Gemini models (recommended)
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+    # OpenAI models
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-mini",
+)
 
 
 def _normalize_save_path(path_result):

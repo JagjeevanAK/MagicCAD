@@ -156,6 +156,7 @@ pthreads-win32 = "*"
 [pypi-dependencies]
 freecad-stubs = "*"
 openai = "*"
+google-generativeai = "*"
 langgraph = "*"
 langgraph-checkpoint-sqlite = "*"
 
