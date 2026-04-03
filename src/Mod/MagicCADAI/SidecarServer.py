@@ -17,7 +17,18 @@ import Validators
 
 
 DEFAULT_MODEL = "gpt-5.4"
+GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
 RULEPACK_VERSION = "v1"
+
+# Model provider detection
+def _get_model_provider(model_name):
+    """Detect which provider to use based on model name."""
+    if not model_name:
+        return "openai"
+    model_lower = model_name.lower()
+    if model_lower.startswith("gemini"):
+        return "gemini"
+    return "openai"
 
 READ_ONLY_TOOL_SPECS = [
     {
@@ -429,6 +440,131 @@ class OpenAIResponder:
         return payload
 
 
+class GeminiResponder:
+    def __init__(self):
+        self._client = None
+        self._model = None
+        self._error = ""
+        if not os.environ.get("GEMINI_API_KEY"):
+            self._error = "GEMINI_API_KEY is not set"
+            return
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+            self._client = genai
+        except Exception as exc:
+            self._error = str(exc)
+
+    @property
+    def available(self):
+        return self._client is not None
+
+    @property
+    def last_error(self):
+        return self._error
+
+    def explain(self, state):
+        if not self.available:
+            return {"assistant_text": "", "assistant_phase": state.get("assistant_phase", ""), "previous_response_id": state.get("previous_response_id", "")}
+
+        snapshot = state.get("snapshot", {})
+        issues = state.get("issues", [])
+        prompt = state.get("prompt", "")
+        model_name = state.get("model", GEMINI_DEFAULT_MODEL)
+        phase = state.get("assistant_phase", "") or ("copilot" if prompt else "validate")
+        payload = {
+            "phase": phase,
+            "intent": state.get("intent", "validate"),
+            "prompt": prompt,
+            "issue_count": len(issues),
+            "issues": issues[:10],
+            "objects": snapshot.get("objects", [])[:20],
+            "selection": snapshot.get("selection", []),
+            "tool_results": state.get("tool_results", [])[-3:],
+        }
+        system_prompt = (
+            "You are MagicCAD AI. Provide concise, actionable CAD review feedback for a FreeCAD-based desktop tool. "
+            "If you need more detail, call a read-only tool. Never ask to run arbitrary Python. "
+            "When you answer directly, return clear prose only."
+        )
+        try:
+            if self._model is None or self._model.name != model_name:
+                self._model = self._client.GenerativeModel(model_name)
+            model = self._model
+            response = model.generate_content(
+                contents=[
+                    {"role": "user", "parts": [system_prompt + "\n\nUser request: " + json.dumps(payload)]}
+                ],
+                tools=self._build_gemini_tools(),
+                generation_config={
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 2048,
+                }
+            )
+            parsed = self._parse_response(response)
+            parsed.setdefault("assistant_phase", phase)
+            parsed["previous_response_id"] = model_name
+            return parsed
+        except Exception as exc:
+            self._error = str(exc)
+            return {"assistant_text": "", "assistant_phase": phase, "previous_response_id": model_name}
+
+    def _build_gemini_tools(self):
+        """Build Gemini-compatible tool specs from READ_ONLY_TOOL_SPECS."""
+        return [
+            {
+                "function_declarations": [
+                    {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["parameters"],
+                    }
+                    for tool in READ_ONLY_TOOL_SPECS
+                ]
+            }
+        ]
+
+    def _parse_response(self, response):
+        """Parse Gemini API response to match OpenAI response format."""
+        text = ""
+        tool_request = None
+
+        try:
+            if hasattr(response, "text") and response.text:
+                text = response.text.strip()
+
+            if hasattr(response, "candidates") and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                    for part in candidate.content.parts:
+                        if hasattr(part, "function_call") and part.function_call:
+                            fc = part.function_call
+                            arguments = {}
+                            if hasattr(fc, "args"):
+                                arguments = dict(fc.args)
+                            tool_request = {
+                                "request_id": uuid.uuid4().hex,
+                                "call_id": fc.name if hasattr(fc, "name") else "",
+                                "tool_name": fc.name if hasattr(fc, "name") else "",
+                                "arguments": arguments,
+                            }
+                            break
+        except Exception:
+            pass
+
+        payload = {
+            "assistant_text": text,
+            "assistant_phase": "",
+            "previous_response_id": "",
+        }
+        if tool_request:
+            payload["pending_tool_request"] = tool_request
+            payload["tool_return_to"] = "llm_explain"
+        return payload
+
+
 class LangGraphRuntime:
     def __init__(self, engine, database_path):
         self._engine = engine
@@ -553,9 +689,18 @@ class LangGraphRuntime:
 class MagicCADAgentEngine:
     def __init__(self, store):
         self._store = store
-        self._llm = OpenAIResponder()
+        self._openai_responder = OpenAIResponder()
+        self._gemini_responder = GeminiResponder()
         self._local = threading.local()
         self._langgraph = LangGraphRuntime(self, self._store.path)
+
+    def _get_responder(self, state):
+        """Get the appropriate responder based on model selection."""
+        model = state.get("model", DEFAULT_MODEL)
+        provider = _get_model_provider(model)
+        if provider == "gemini":
+            return self._gemini_responder, "gemini"
+        return self._openai_responder, "openai"
 
     @property
     def langgraph_available(self):
@@ -617,7 +762,8 @@ class MagicCADAgentEngine:
         }
 
     def llm_explain(self, state):
-        explanation = self._llm.explain(state)
+        responder, provider = self._get_responder(state)
+        explanation = responder.explain(state)
         text = explanation.get("assistant_text", "")
         if not text:
             text = self._fallback_explanation(state.get("snapshot", {}), state.get("issues", []), state.get("prompt", ""))
@@ -631,9 +777,11 @@ class MagicCADAgentEngine:
             "pending_tool_request": explanation.get("pending_tool_request"),
             "tool_return_to": explanation.get("tool_return_to", ""),
             "backend": {
-                "openai": self._llm.available,
+                "openai": self._openai_responder.available,
+                "gemini": self._gemini_responder.available,
                 "langgraph": self._langgraph.available,
                 "model": state.get("model", DEFAULT_MODEL),
+                "provider": provider,
             },
         }
         return updates
@@ -986,7 +1134,8 @@ class MagicCADAgentEngine:
             "proposed_changes": proposed_changes,
             "model_info": {
                 "requested_model": state.get("model", DEFAULT_MODEL),
-                "openai_enabled": self._llm.available,
+                "openai_enabled": self._openai_responder.available,
+                "gemini_enabled": self._gemini_responder.available,
                 "langgraph_enabled": self._langgraph.available,
                 "langgraph_error": self._langgraph.error,
             },
@@ -1022,6 +1171,14 @@ class ServerState:
             "status": "ready",
             "timestamp": utc_now(),
             "langgraph_enabled": self._engine.langgraph_available,
+            "backends": {
+                "openai": self._engine._openai_responder.available,
+                "gemini": self._engine._gemini_responder.available,
+            },
+            "errors": {
+                "openai": self._engine._openai_responder.last_error if not self._engine._openai_responder.available else "",
+                "gemini": self._engine._gemini_responder.last_error if not self._engine._gemini_responder.available else "",
+            },
         }
 
     def create_run(self, request):

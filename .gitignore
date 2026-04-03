@@ -71,3 +71,9 @@ tsupdate_stdout.log
 # pixi environments
 *.egg-info
 .pixi
+
+# API keys - DO NOT COMMIT
+.env
+*.env
+genai.env
+

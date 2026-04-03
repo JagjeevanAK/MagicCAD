@@ -6,7 +6,7 @@ import FreeCAD
 import FreeCADGui as Gui
 
 
-class MagicCADAIWorkbench(Workbench):
+class MagicCADAIWorkbench(Gui.Workbench):
     def __init__(self):
         resource_root = FreeCAD.getResourceDir()
         icon_candidates = (
