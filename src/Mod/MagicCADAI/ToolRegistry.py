@@ -316,7 +316,12 @@ def apply_ops(ops, document=None, transaction_name="MagicCAD AI Draft"):
 
     _log("apply_ops_start", document=getattr(document, "Name", ""), transaction_name=transaction_name, ops=ops)
     results = []
-    document.openTransaction(transaction_name)
+    
+    # We intentionally bypass explicit document.openTransaction() because
+    # FreeCAD can sometimes be left in a mid-transaction state ("Cannot
+    # commit transaction while transacting"), which aborts our entire script
+    # and erases the created features. We'll simply let the document auto-handle
+    # undo groups or rely on our caller.
     try:
         for op in ops:
             result = _apply_operation(document, op)
@@ -324,11 +329,9 @@ def apply_ops(ops, document=None, transaction_name="MagicCAD AI Draft"):
             if not result.get("ok", False):
                 raise RuntimeError(result.get("error", "Operation failed"))
         document.recompute()
-        document.commitTransaction()
         _log("apply_ops_success", document=getattr(document, "Name", ""), results=results)
         return _success(results=results)
     except Exception as exc:
-        document.abortTransaction()
         _log("apply_ops_failure", document=getattr(document, "Name", ""), error=str(exc), results=results, traceback=traceback.format_exc())
         return _failure(str(exc), results=results, traceback=traceback.format_exc())
 

@@ -809,10 +809,8 @@ class MagicCADAIController(QtCore.QObject):
                 active_view = getattr(gui_doc, "ActiveView", None)
                 if active_view is not None:
                     active_view.fitAll()
-                    self._repair_active_view_camera(document_name, created_names, active_view=active_view)
                 else:
                     FreeCADGui.SendMsgToActiveView("ViewFit")
-                    self._repair_active_view_camera(document_name, created_names)
             except Exception:
                 pass
             try:
