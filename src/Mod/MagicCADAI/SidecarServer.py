@@ -95,7 +95,7 @@ WRITE_TOOL_SPECS = [
         "name": "apply_ops",
         "description": (
             "Apply bounded local CAD write operations to the active FreeCAD document. "
-            "Supported ops are create_involute_gear, create_body, create_box, rename_object, set_parameter, and recompute."
+            "Supported ops are create_involute_gear, create_cylinder, create_body, create_box, rename_object, set_parameter, and recompute."
         ),
         "parameters": {
             "type": "object",
@@ -108,12 +108,13 @@ WRITE_TOOL_SPECS = [
                         "properties": {
                             "op": {
                                 "type": "string",
-                                "enum": ["create_involute_gear", "create_body", "create_box", "rename_object", "set_parameter", "recompute"],
+                                "enum": ["create_involute_gear", "create_cylinder", "create_body", "create_box", "rename_object", "set_parameter", "recompute"],
                             },
                             "name": {"type": "string"},
                             "length": {"type": "number"},
                             "width": {"type": "number"},
                             "height": {"type": "number"},
+                            "radius": {"type": "number"},
                             "x": {"type": "number"},
                             "y": {"type": "number"},
                             "z": {"type": "number"},
@@ -176,6 +177,7 @@ def _system_prompt_for_intent(intent):
             "Do not claim you cannot create objects. You are not running arbitrary Python; you are selecting from the available desktop tools. "
             "If the request is specific enough, prefer using apply_ops to create or edit geometry directly. "
             "For simple visible geometry, prefer create_box over create_body. "
+            "Use create_cylinder for cylindrical/round objects. "
             "When answering directly, briefly describe the action you are taking or the missing information you need."
         )
     return (
