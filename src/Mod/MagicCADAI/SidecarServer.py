@@ -95,7 +95,7 @@ WRITE_TOOL_SPECS = [
         "name": "apply_ops",
         "description": (
             "Apply bounded local CAD write operations to the active FreeCAD document. "
-            "Supported ops are create_involute_gear, create_body, rename_object, set_parameter, and recompute."
+            "Supported ops are create_involute_gear, create_body, create_box, rename_object, set_parameter, and recompute."
         ),
         "parameters": {
             "type": "object",
@@ -108,9 +108,15 @@ WRITE_TOOL_SPECS = [
                         "properties": {
                             "op": {
                                 "type": "string",
-                                "enum": ["create_involute_gear", "create_body", "rename_object", "set_parameter", "recompute"],
+                                "enum": ["create_involute_gear", "create_body", "create_box", "rename_object", "set_parameter", "recompute"],
                             },
                             "name": {"type": "string"},
+                            "length": {"type": "number"},
+                            "width": {"type": "number"},
+                            "height": {"type": "number"},
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "z": {"type": "number"},
                             "number_of_teeth": {"type": "integer"},
                             "module": {"type": "number"},
                             "pressure_angle": {"type": "number"},
@@ -169,6 +175,7 @@ def _system_prompt_for_intent(intent):
             "For copilot requests, you may inspect the document with read-only tools and you may apply bounded local CAD write tools. "
             "Do not claim you cannot create objects. You are not running arbitrary Python; you are selecting from the available desktop tools. "
             "If the request is specific enough, prefer using apply_ops to create or edit geometry directly. "
+            "For simple visible geometry, prefer create_box over create_body. "
             "When answering directly, briefly describe the action you are taking or the missing information you need."
         )
     return (
@@ -182,8 +189,49 @@ def utc_now():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            key_text = str(key)
+            # LangGraph injects internal interrupt metadata that is not stable
+            # or serializable. Keep runtime state in memory, but do not persist
+            # these implementation details to SQLite.
+            if key_text.startswith("__interrupt__"):
+                continue
+            safe[key_text] = _json_safe(item)
+        return safe
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "_asdict"):
+        try:
+            return _json_safe(value._asdict())
+        except Exception:
+            pass
+    if value.__class__.__name__ == "Interrupt":
+        payload = {"type": "Interrupt"}
+        for attr in ("value", "resumable", "ns", "when"):
+            if hasattr(value, attr):
+                try:
+                    payload[attr] = _json_safe(getattr(value, attr))
+                except Exception:
+                    pass
+        return payload
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                "__class__": value.__class__.__name__,
+                "attributes": _json_safe(vars(value)),
+            }
+        except Exception:
+            pass
+    return str(value)
+
+
 def _json_dumps(value):
-    return json.dumps(value, sort_keys=True)
+    return json.dumps(_json_safe(value), sort_keys=True)
 
 
 def _configure_logging(log_path):
@@ -372,6 +420,7 @@ class RunRecord:
 
 class PromptInterpreter:
     GEAR_HINTS = ("gear", "spur gear", "involute")
+    BOX_HINTS = ("box", "cube", "block", "sheet", "plate", "body", "minimal thing", "simple component")
 
     @classmethod
     def plan_changes(cls, snapshot, prompt, issues):
@@ -381,6 +430,8 @@ class PromptInterpreter:
         lowered = prompt.lower()
         if any(token in lowered for token in cls.GEAR_HINTS):
             return [cls._gear_change(prompt, snapshot)]
+        if any(token in lowered for token in cls.BOX_HINTS):
+            return [cls._box_change(prompt, snapshot)]
         return []
 
     @classmethod
@@ -461,6 +512,58 @@ class PromptInterpreter:
             op.get("thickness", 8.0),
             op.get("center_bore", 6.0),
         )
+
+    @classmethod
+    def _box_change(cls, prompt, snapshot):
+        length, width = cls._extract_pair(prompt)
+        op = {
+            "op": "create_box",
+            "name": cls._pick_box_name(snapshot),
+            "length": float(length or 10.0),
+            "width": float(width or length or 10.0),
+            "height": float(
+                cls._extract_number(
+                    prompt,
+                    r"(?:height|thickness|depth)\s*(?:of|=)?\s*([0-9]+(?:\.[0-9]+)?)",
+                    1.0 if any(token in prompt.lower() for token in ("sheet", "plate")) else 10.0,
+                )
+            ),
+        }
+        return {
+            "change_id": uuid.uuid4().hex,
+            "summary": cls._box_summary(op),
+            "risk_level": "low",
+            "ops": [op, {"op": "recompute"}],
+        }
+
+    @classmethod
+    def _box_summary(cls, op):
+        return "Create a box named {0} with size {1} x {2} x {3} mm.".format(
+            op.get("name", "MagicBox"),
+            op.get("length", 10.0),
+            op.get("width", 10.0),
+            op.get("height", 10.0),
+        )
+
+    @classmethod
+    def _pick_box_name(cls, snapshot):
+        names = {obj.get("name", "") for obj in snapshot.get("objects", [])}
+        candidate = "MagicBox"
+        index = 1
+        while candidate in names:
+            index += 1
+            candidate = "MagicBox{0:03d}".format(index)
+        return candidate
+
+    @classmethod
+    def _extract_pair(cls, text):
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:x|by)\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+        if not match:
+            return None, None
+        try:
+            return float(match.group(1)), float(match.group(2))
+        except Exception:
+            return None, None
 
     @classmethod
     def _pick_result_name(cls, snapshot):
@@ -862,7 +965,10 @@ class LangGraphRuntime:
             self._engine.publish_node(node_name, "running")
             updates = fn(state)
             self._engine.publish_node(node_name, "completed")
-            return updates
+            merged = dict(state or {})
+            if isinstance(updates, dict):
+                merged.update(updates)
+            return merged
 
         return wrapper
 
@@ -949,17 +1055,28 @@ class MagicCADAgentEngine:
         responder, provider = self._get_responder(state)
         explanation = responder.explain(state)
         text = explanation.get("assistant_text", "")
+        pending_tool_request = explanation.get("pending_tool_request")
         used_fallback = False
         backend_warning = ""
-        if not text:
-            used_fallback = True
-            backend_warning = _summarize_backend_error(provider, responder.last_error)
-            text = self._fallback_explanation(
-                state.get("snapshot", {}),
-                state.get("issues", []),
-                state.get("prompt", ""),
-                state.get("intent", "validate"),
-            )
+        if not text and not pending_tool_request:
+            intent = state.get("intent", "validate")
+            error_text = (responder.last_error or "").strip()
+            if intent == "copilot":
+                if error_text:
+                    text = "Copilot model error: {0}".format(error_text)
+                    backend_warning = _summarize_backend_error(provider, error_text) or text
+                else:
+                    text = "Copilot model returned no text and no tool call."
+                used_fallback = False
+            else:
+                used_fallback = True
+                backend_warning = _summarize_backend_error(provider, responder.last_error)
+                text = self._fallback_explanation(
+                    state.get("snapshot", {}),
+                    state.get("issues", []),
+                    state.get("prompt", ""),
+                    intent,
+                )
         _log(
             "info",
             "llm_explain",
@@ -982,7 +1099,7 @@ class MagicCADAgentEngine:
             "assistant_phase": explanation.get("assistant_phase", "llm_explain") or "llm_explain",
             "assistant_text": text,
             "previous_response_id": explanation.get("previous_response_id", state.get("previous_response_id", "")),
-            "pending_tool_request": explanation.get("pending_tool_request"),
+            "pending_tool_request": pending_tool_request,
             "tool_return_to": explanation.get("tool_return_to", ""),
             "backend": {
                 "openai": self._openai_responder.available,

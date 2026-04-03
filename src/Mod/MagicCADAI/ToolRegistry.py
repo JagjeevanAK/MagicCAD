@@ -178,8 +178,30 @@ def _create_involute_gear(document, op):
 
 def _create_body(document, op):
     name = op.get("name", "Body")
-    body = document.addObject("PartDesign::Body", name)
-    return _success(created=[body.Name], result_object=body.Name)
+    # FreeCAD's PartDesign::Body creation is not reliable in this sidecar path on
+    # the current build. Create a visible primitive instead so tool calls produce
+    # immediate on-canvas geometry.
+    return _create_box(document, {"name": name})
+
+
+def _create_box(document, op):
+    name = op.get("name", "Box")
+    length = float(op.get("length", op.get("x", 10.0)) or 10.0)
+    width = float(op.get("width", op.get("y", 10.0)) or 10.0)
+    height = float(op.get("height", op.get("z", 10.0)) or 10.0)
+    box = document.addObject("Part::Box", name)
+    box.Length = length
+    box.Width = width
+    box.Height = height
+    _style_created_object(box)
+    _log(
+        "create_box_created",
+        object_name=getattr(box, "Name", ""),
+        length=length,
+        width=width,
+        height=height,
+    )
+    return _success(created=[box.Name], result_object=box.Name)
 
 
 def _rename_object(document, op):
@@ -217,6 +239,8 @@ def _apply_operation(document, op):
         return _create_involute_gear(document, op)
     if op_name == "create_body":
         return _create_body(document, op)
+    if op_name == "create_box":
+        return _create_box(document, op)
     if op_name == "rename_object":
         return _rename_object(document, op)
     if op_name == "set_parameter":

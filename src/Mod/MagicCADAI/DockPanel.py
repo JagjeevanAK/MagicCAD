@@ -486,11 +486,34 @@ class MagicCADAIController(QtCore.QObject):
         self._running_run_id = ""
         self._pending_approval = None
         self._run_meta = {}
+        self._handled_tool_request_ids = set()
         self._last_snapshot = None
         self._last_report = None
         self._last_document_name = ""
         self._last_auto_validation_at = 0.0
         self._auto_validation_hold_until = 0.0
+
+    def _log_debug(self, message, **payload):
+        try:
+            current = os.path.abspath(os.path.dirname(__file__))
+            while current and current != os.path.dirname(current):
+                candidate = os.path.join(current, "pixi.toml")
+                if os.path.exists(candidate):
+                    log_path = os.path.join(current, "magiccadai.log")
+                    break
+                current = os.path.dirname(current)
+            else:
+                log_path = os.path.abspath("magiccadai.log")
+            line = "{0} INFO [DockPanel] {1}".format(
+                datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                message,
+            )
+            if payload:
+                line += " | " + json.dumps(payload, sort_keys=True, default=str)
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
 
     def _provider_for_model(self, model_name):
         model_name = str(model_name or "").strip().lower()
@@ -522,6 +545,29 @@ class MagicCADAIController(QtCore.QObject):
             if result_object:
                 yield result_object
 
+    def _format_tool_request_text(self, event):
+        tool_name = str(event.get("tool_name", "") or "tool")
+        arguments = event.get("arguments", {}) or {}
+        if arguments:
+            try:
+                payload = json.dumps(arguments, sort_keys=True)
+            except Exception:
+                payload = repr(arguments)
+            return "Tool call: {0}({1})".format(tool_name, payload)
+        return "Tool call: {0}()".format(tool_name)
+
+    def _format_tool_result_text(self, event, result):
+        tool_name = str(event.get("tool_name", "") or "tool")
+        if not result.get("ok", False):
+            return "Tool result: {0} failed: {1}".format(tool_name, result.get("error", "unknown error"))
+        created = []
+        for name in self._iter_created_object_names(result):
+            if name and name not in created:
+                created.append(name)
+        if created:
+            return "Tool result: {0} created {1}.".format(tool_name, ", ".join(created))
+        return "Tool result: {0} completed successfully.".format(tool_name)
+
     def _focus_created_objects(self, document, tool_result):
         if document is None or not FreeCAD.GuiUp:
             return
@@ -541,6 +587,24 @@ class MagicCADAIController(QtCore.QObject):
             if obj is None:
                 continue
             objects.append(obj)
+            shape = getattr(obj, "Shape", None)
+            bbox_payload = {}
+            if shape is not None and not getattr(shape, "isNull", lambda: True)():
+                try:
+                    bbox = shape.BoundBox
+                    bbox_payload = {
+                        "xmin": float(bbox.XMin),
+                        "ymin": float(bbox.YMin),
+                        "zmin": float(bbox.ZMin),
+                        "xmax": float(bbox.XMax),
+                        "ymax": float(bbox.YMax),
+                        "zmax": float(bbox.ZMax),
+                        "xlen": float(bbox.XLength),
+                        "ylen": float(bbox.YLength),
+                        "zlen": float(bbox.ZLength),
+                    }
+                except Exception:
+                    bbox_payload = {}
             view = getattr(obj, "ViewObject", None)
             if view is not None:
                 try:
@@ -552,9 +616,24 @@ class MagicCADAIController(QtCore.QObject):
                         mode_names = []
                         if hasattr(view, "listDisplayModes"):
                             mode_names = list(view.listDisplayModes())
-                        preferred = "Flat Lines" if "Flat Lines" in mode_names else ("Shaded" if "Shaded" in mode_names else "")
+                        preferred = "Shaded" if "Shaded" in mode_names else ("Flat Lines" if "Flat Lines" in mode_names else "")
                         if preferred:
                             view.DisplayMode = preferred
+                except Exception:
+                    pass
+                try:
+                    if hasattr(view, "ShapeColor"):
+                        view.ShapeColor = (0.84, 0.32, 0.18)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(view, "LineColor"):
+                        view.LineColor = (0.95, 0.95, 0.98)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(view, "LineWidth"):
+                        view.LineWidth = 3.0
                 except Exception:
                     pass
                 try:
@@ -562,6 +641,17 @@ class MagicCADAIController(QtCore.QObject):
                         view.Transparency = 0
                 except Exception:
                     pass
+            self._log_debug(
+                "focus_created_object",
+                document=getattr(document, "Name", ""),
+                object_name=getattr(obj, "Name", ""),
+                type_id=getattr(obj, "TypeId", ""),
+                label=getattr(obj, "Label", ""),
+                view_visible=getattr(view, "Visibility", None) if view is not None else None,
+                view_display_mode=getattr(view, "DisplayMode", "") if view is not None else "",
+                view_transparency=getattr(view, "Transparency", None) if view is not None else None,
+                bbox=bbox_payload,
+            )
 
         if not objects:
             return
@@ -573,10 +663,41 @@ class MagicCADAIController(QtCore.QObject):
         except Exception:
             pass
 
+        active_view = None
         try:
-            FreeCADGui.activeDocument().activeView().viewAxonometric()
+            first_view = getattr(objects[0], "ViewObject", None)
+            first_gui_doc = getattr(first_view, "Document", None) if first_view is not None else None
+            active_view = first_gui_doc.activeView() if first_gui_doc is not None else None
         except Exception:
-            pass
+            active_view = None
+        if active_view is None:
+            try:
+                active_gui_doc = FreeCADGui.activeDocument()
+                active_view = active_gui_doc.activeView() if active_gui_doc is not None else None
+            except Exception:
+                active_view = None
+        if active_view is not None:
+            try:
+                active_view.viewIsometric()
+            except Exception:
+                try:
+                    active_view.viewAxonometric()
+                except Exception:
+                    pass
+            try:
+                if hasattr(active_view, "setCameraType"):
+                    active_view.setCameraType("Perspective")
+            except Exception:
+                pass
+            try:
+                active_view.fitAll()
+            except Exception:
+                pass
+            self._log_debug(
+                "focus_created_view_state",
+                document=getattr(document, "Name", ""),
+                view_type=active_view.__class__.__name__,
+            )
         try:
             FreeCADGui.SendMsgToActiveView("ViewSelection")
         except Exception:
@@ -585,6 +706,16 @@ class MagicCADAIController(QtCore.QObject):
             FreeCADGui.updateGui()
         except Exception:
             pass
+        try:
+            selection_names = [obj.Name for obj in FreeCADGui.Selection.getSelection(document.Name)]
+        except Exception:
+            selection_names = []
+        self._log_debug(
+            "focus_created_objects_complete",
+            document=getattr(document, "Name", ""),
+            created_names=created_names,
+            selection=selection_names,
+        )
 
     def ensure_initialized(self):
         if self._initialized:
@@ -850,6 +981,7 @@ class MagicCADAIController(QtCore.QObject):
 
         if event_name == "run_started":
             self._running_run_id = run_id
+            self._handled_tool_request_ids.clear()
             if session is not None:
                 SessionObjects.update_session(session, run_id=run_id, status="running")
         elif event_name == "node_status":
@@ -880,18 +1012,27 @@ class MagicCADAIController(QtCore.QObject):
             self._widget.set_approval_notice("Local document changes need approval. Review the draft below, then use Apply Draft, Revise Draft, or Reject Draft.")
             self._widget.tabs.setCurrentIndex(2)
         elif event_name == "tool_request":
+            request_id = event.get("request_id", "")
+            if request_id and request_id in self._handled_tool_request_ids:
+                return
+            if request_id:
+                self._handled_tool_request_ids.add(request_id)
+            if self._run_is_interactive(run_id):
+                self._widget.append_transcript(self._format_tool_request_text(event))
             if not document:
                 self._bridge.submit_tool_results(
                     run_id,
-                    {"request_id": event.get("request_id", ""), "result": {"ok": False, "error": "No active document"}},
+                    {"request_id": request_id, "result": {"ok": False, "error": "No active document"}},
                 )
                 return
             self._auto_validation_hold_until = time.time() + 2.0
             result = ToolRegistry.execute_tool_request(event, document=document)
             self._bridge.submit_tool_results(
                 run_id,
-                {"request_id": event.get("request_id", ""), "result": result},
+                {"request_id": request_id, "result": result},
             )
+            if self._run_is_interactive(run_id):
+                self._widget.append_transcript(self._format_tool_result_text(event, result))
             if result.get("ok", False):
                 self._focus_created_objects(document, result)
             else:
@@ -923,6 +1064,7 @@ class MagicCADAIController(QtCore.QObject):
                 SessionObjects.update_session(session, status="error")
         elif event_name == "run_finished":
             self._running_run_id = ""
+            self._handled_tool_request_ids.clear()
             finished_status = event.get("status", "completed")
             self._set_status("Run {0} finished with status {1}".format(run_id, finished_status))
             self._run_meta.pop(run_id, None)
