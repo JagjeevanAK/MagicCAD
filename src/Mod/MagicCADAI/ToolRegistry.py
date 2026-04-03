@@ -1,9 +1,35 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import datetime
+import json
+import os
 import traceback
 
 import FreeCAD
 import Part
+
+
+def _project_root():
+    current = os.path.abspath(os.path.dirname(__file__))
+    while current and current != os.path.dirname(current):
+        if os.path.exists(os.path.join(current, "pixi.toml")):
+            return current
+        current = os.path.dirname(current)
+    return os.path.abspath(os.getcwd())
+
+
+def _log(message, **payload):
+    try:
+        line = "{0} INFO [ToolRegistry] {1}".format(
+            datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            message,
+        )
+        if payload:
+            line += " | " + json.dumps(payload, sort_keys=True, default=str)
+        with open(os.path.join(_project_root(), "magiccadai.log"), "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        pass
 
 
 def _style_created_object(obj):
@@ -89,6 +115,7 @@ def get_object_details(document=None, object_name=""):
 def _create_involute_gear(document, op):
     from fcgear import fcgear, involute
 
+    _log("create_involute_gear_start", document=getattr(document, "Name", ""), op=op)
     name = op.get("name", "InvoluteGear")
     thickness = float(op.get("thickness", 0.0) or 0.0)
     bore = float(op.get("center_bore", 0.0) or 0.0)
@@ -125,11 +152,24 @@ def _create_involute_gear(document, op):
             solid_shape = solid_shape.cut(Part.makeCylinder(bore / 2.0, thickness))
         solid = Part.show(solid_shape, name)
         _style_created_object(solid)
+        _log(
+            "create_involute_gear_solid_created",
+            object_name=solid.Name,
+            shape_type=str(getattr(solid_shape, "ShapeType", "")),
+            volume=float(getattr(solid_shape, "Volume", 0.0)),
+            area=float(getattr(solid_shape, "Area", 0.0)),
+        )
         created.append(solid.Name)
         result = solid
     else:
         profile = Part.show(gear_wire, name)
         _style_created_object(profile)
+        _log(
+            "create_involute_gear_profile_created",
+            object_name=profile.Name,
+            shape_type=str(getattr(gear_wire, "ShapeType", "")),
+            length=float(getattr(gear_wire, "Length", 0.0)),
+        )
         created.append(profile.Name)
         result = profile
 
@@ -191,6 +231,7 @@ def apply_ops(ops, document=None, transaction_name="MagicCAD AI Draft"):
     if document is None:
         return _failure("No active document")
 
+    _log("apply_ops_start", document=getattr(document, "Name", ""), transaction_name=transaction_name, ops=ops)
     results = []
     document.openTransaction(transaction_name)
     try:
@@ -201,15 +242,18 @@ def apply_ops(ops, document=None, transaction_name="MagicCAD AI Draft"):
                 raise RuntimeError(result.get("error", "Operation failed"))
         document.recompute()
         document.commitTransaction()
+        _log("apply_ops_success", document=getattr(document, "Name", ""), results=results)
         return _success(results=results)
     except Exception as exc:
         document.abortTransaction()
+        _log("apply_ops_failure", document=getattr(document, "Name", ""), error=str(exc), results=results, traceback=traceback.format_exc())
         return _failure(str(exc), results=results, traceback=traceback.format_exc())
 
 
 def execute_tool_request(tool_request, document=None):
     tool_name = tool_request.get("tool_name", "")
     arguments = tool_request.get("arguments", {})
+    _log("execute_tool_request", tool_name=tool_name, arguments=arguments, document=getattr(_document(document), "Name", ""))
     if tool_name == "get_object_details":
         return get_object_details(document=document, object_name=arguments.get("object_name", ""))
     if tool_name == "get_document_snapshot":

@@ -5,9 +5,9 @@ import os
 
 MODULE_NAME = "MagicCADAI"
 WORKBENCH_NAME = "MagicCADAIWorkbench"
-DEFAULT_MODEL = "gemini-2.0-flash"  # Gemini - fast and cost-effective
-DEEP_REVIEW_MODEL = "gemini-1.5-pro"  # For complex analysis
-BACKGROUND_MODEL = "gemini-1.5-flash"  # For quick background tasks
+DEFAULT_MODEL = "gemini-2.5-flash"  # Gemini - fast and cost-effective
+DEEP_REVIEW_MODEL = "gemini-2.5-pro"  # For complex analysis
+BACKGROUND_MODEL = "gemini-2.5-flash-lite"  # For quick background tasks
 RULEPACK_VERSION = "v1"
 
 MODULE_DIR = os.path.dirname(__file__)

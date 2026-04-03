@@ -23,11 +23,18 @@ QtGui = QtCompat.QtGui
 QtWidgets = QtCompat.QtWidgets
 Qt = QtCompat.Qt
 
+DEFAULT_MODEL = "gemini-2.5-flash"
 MODEL_OPTIONS = (
     # Gemini models (recommended)
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
+    # Groq models
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
     # OpenAI models
     "gpt-5.4",
     "gpt-5.4-pro",
@@ -53,6 +60,20 @@ class MarkdownTextBrowser(QtWidgets.QTextBrowser):
             except Exception:
                 self.setPlainText(text)
         self.setGeometry(geometry)
+
+
+class CopilotPromptInput(QtWidgets.QPlainTextEdit):
+    def __init__(self, submit_callback, parent=None):
+        super(CopilotPromptInput, self).__init__(parent)
+        self._submit_callback = submit_callback
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+            if self.toPlainText().strip():
+                event.accept()
+                self._submit_callback()
+                return
+        super(CopilotPromptInput, self).keyPressEvent(event)
 
 
 def _escape_markdown_text(text):
@@ -147,7 +168,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         composer_layout.setContentsMargins(8, 8, 8, 8)
         composer_layout.setSpacing(8)
 
-        self.prompt_input = QtWidgets.QPlainTextEdit()
+        self.prompt_input = CopilotPromptInput(self._controller.run_copilot)
         self.prompt_input.setObjectName("composer")
         if hasattr(self.prompt_input, "setPlaceholderText"):
             self.prompt_input.setPlaceholderText("Describe what to build")
@@ -161,15 +182,17 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         self.model_combo.setObjectName("footerCombo")
         for model in MODEL_OPTIONS:
             self.model_combo.addItem(model)
-        self.model_combo.setCurrentIndex(0)
+        self.set_current_model(DEFAULT_MODEL)
         bottom_row.addWidget(self.model_combo)
         self.run_copilot_button = QtWidgets.QPushButton("Submit")
         self.run_copilot_button.setObjectName("primaryButton")
+        self.run_copilot_button.setEnabled(False)
         bottom_row.addStretch(1)
         bottom_row.addWidget(self.run_copilot_button)
         composer_layout.addLayout(bottom_row)
         tab_layout.addWidget(composer_card)
         self.tabs.addTab(tab, "Copilot")
+        self.prompt_input.textChanged.connect(self._update_copilot_submit_state)
 
     def _build_issues_tab(self):
         tab = QtWidgets.QWidget()
@@ -358,8 +381,22 @@ class MagicCADAIWidget(QtWidgets.QWidget):
     def current_model(self):
         return str(self.model_combo.currentText())
 
+    def set_current_model(self, model_name):
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            model_name = DEFAULT_MODEL
+        index = self.model_combo.findText(model_name)
+        if index < 0:
+            index = self.model_combo.findText(DEFAULT_MODEL)
+        if index < 0:
+            index = 0
+        self.model_combo.setCurrentIndex(index)
+
     def current_prompt(self):
         return str(self.prompt_input.toPlainText())
+
+    def _update_copilot_submit_state(self):
+        self.run_copilot_button.setEnabled(bool(self.current_prompt().strip()))
 
     def auto_validate_enabled(self):
         return self.auto_validate.isChecked()
@@ -455,6 +492,25 @@ class MagicCADAIController(QtCore.QObject):
         self._last_auto_validation_at = 0.0
         self._auto_validation_hold_until = 0.0
 
+    def _provider_for_model(self, model_name):
+        model_name = str(model_name or "").strip().lower()
+        if model_name.startswith("gemini"):
+            return "gemini"
+        if model_name.startswith(("llama-", "meta-llama/", "qwen/", "openai/gpt-oss-", "groq/")):
+            return "groq"
+        return "openai"
+
+    def _sync_model_from_document(self, document=None):
+        if self._widget is None:
+            return
+        document = document or FreeCAD.ActiveDocument
+        if document is None:
+            self._widget.set_current_model(DEFAULT_MODEL)
+            return
+        _root, session, _report_obj = SessionObjects.ensure_storage(document)
+        session_model = getattr(session, "ModelName", "") if session is not None else ""
+        self._widget.set_current_model(session_model or DEFAULT_MODEL)
+
     def _iter_created_object_names(self, tool_result):
         result = tool_result or {}
         for entry in result.get("results", []) or []:
@@ -540,12 +596,15 @@ class MagicCADAIController(QtCore.QObject):
         self.ensure_initialized()
         if self._dock is None:
             self._create_panel()
+        self._sync_model_from_document()
         self._dock.show()
         self._dock.raise_()
         self._dock.setVisible(True)
         return self._dock
 
     def on_document_event(self, reason, document):
+        if reason in ("activate", "created_document"):
+            self._sync_model_from_document(document)
         if not self._should_auto_validate(document):
             return
         if reason in ("changed_object", "recomputed_object", "recomputed_document", "undo", "redo"):
@@ -596,14 +655,20 @@ class MagicCADAIController(QtCore.QObject):
         prompt = self._widget.current_prompt().strip() if prompt is None else prompt
         if auto:
             prompt = ""
+        selected_model = self._widget.current_model()
+        stored_model = getattr(session, "ModelName", "") if session is not None else ""
+        stored_previous_response_id = getattr(session, "PreviousResponseId", "") if session is not None else ""
+        previous_response_id = ""
+        if self._provider_for_model(selected_model) == "openai" and self._provider_for_model(stored_model or selected_model) == "openai":
+            previous_response_id = stored_previous_response_id
 
         request = {
             "thread_id": getattr(session, "ThreadId", ""),
-            "previous_response_id": getattr(session, "PreviousResponseId", ""),
+            "previous_response_id": previous_response_id,
             "snapshot": snapshot,
             "intent": intent,
             "prompt": prompt,
-            "model": self._widget.current_model(),
+            "model": selected_model,
             "selection_only": selection_only,
             "requested_at": _utc_now(),
         }
@@ -625,13 +690,15 @@ class MagicCADAIController(QtCore.QObject):
             payload={"intent": intent, "selection_only": selection_only, "auto": auto},
         )
         self._widget.set_draft_state(False, False, False)
+        self._sync_model_from_document(document)
         self._set_status("MagicCAD AI run in progress...")
 
     def run_copilot(self):
         prompt = self._widget.current_prompt().strip()
-        if prompt:
-            self._widget.append_user_transcript(prompt)
-            self._widget.prompt_input.clear()
+        if not prompt:
+            return
+        self._widget.append_user_transcript(prompt)
+        self._widget.prompt_input.clear()
         self.validate_document(selection_only=False, intent="copilot", prompt=prompt, auto=False)
 
     def _ensure_copilot_document(self):
@@ -747,6 +814,7 @@ class MagicCADAIController(QtCore.QObject):
         self._dock.setWidget(self._widget)
         self._dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         FreeCADGui.getMainWindow().addDockWidget(Qt.RightDockWidgetArea, self._dock)
+        self._sync_model_from_document()
 
     def _run_is_interactive(self, run_id):
         meta = self._run_meta.get(run_id, {})
@@ -786,6 +854,10 @@ class MagicCADAIController(QtCore.QObject):
                 SessionObjects.update_session(session, run_id=run_id, status="running")
         elif event_name == "node_status":
             self._set_status("{0}: {1}".format(event.get("node", "node"), event.get("status", "")))
+        elif event_name == "backend_warning":
+            if self._run_is_interactive(run_id):
+                self._widget.append_transcript(event.get("message", "Backend warning"))
+            self._set_status(event.get("message", "Backend warning"))
         elif event_name == "assistant_delta":
             if self._run_is_interactive(run_id):
                 self._widget.append_transcript(event.get("text", ""), markdown=True)

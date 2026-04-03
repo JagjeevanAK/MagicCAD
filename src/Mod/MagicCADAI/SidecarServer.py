@@ -4,6 +4,7 @@ import argparse
 import datetime
 import html as html_lib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -16,9 +17,29 @@ from urllib.parse import urlparse
 import Validators
 
 
-DEFAULT_MODEL = "gpt-5.4"
-GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = GEMINI_DEFAULT_MODEL
 RULEPACK_VERSION = "v1"
+LOGGER = logging.getLogger("MagicCADAI")
+
+GROQ_MODEL_PREFIXES = (
+    "groq/",
+    "llama-3.1-",
+    "llama-3.3-",
+    "meta-llama/",
+    "moonshotai/",
+    "openai/gpt-oss-",
+    "qwen/",
+)
+
+GROQ_MODEL_NAMES = {
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+}
 
 # Model provider detection
 def _get_model_provider(model_name):
@@ -28,6 +49,10 @@ def _get_model_provider(model_name):
     model_lower = model_name.lower()
     if model_lower.startswith("gemini"):
         return "gemini"
+    if model_lower in GROQ_MODEL_NAMES:
+        return "groq"
+    if model_lower.startswith(GROQ_MODEL_PREFIXES):
+        return "groq"
     return "openai"
 
 READ_ONLY_TOOL_SPECS = [
@@ -64,6 +89,94 @@ READ_ONLY_TOOL_SPECS = [
     },
 ]
 
+WRITE_TOOL_SPECS = [
+    {
+        "type": "function",
+        "name": "apply_ops",
+        "description": (
+            "Apply bounded local CAD write operations to the active FreeCAD document. "
+            "Supported ops are create_involute_gear, create_body, rename_object, set_parameter, and recompute."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ops": {
+                    "type": "array",
+                    "description": "Ordered local CAD operations to execute.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": ["create_involute_gear", "create_body", "rename_object", "set_parameter", "recompute"],
+                            },
+                            "name": {"type": "string"},
+                            "number_of_teeth": {"type": "integer"},
+                            "module": {"type": "number"},
+                            "pressure_angle": {"type": "number"},
+                            "thickness": {"type": "number"},
+                            "center_bore": {"type": "number"},
+                            "external_gear": {"type": "boolean"},
+                            "addendum_coefficient": {"type": "number"},
+                            "dedendum_coefficient": {"type": "number"},
+                            "root_fillet_coefficient": {"type": "number"},
+                            "profile_shift_coefficient": {"type": "number"},
+                            "object_name": {"type": "string"},
+                            "new_label": {"type": "string"},
+                            "property_name": {"type": "string"},
+                            "value": {},
+                        },
+                        "required": ["op"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["ops"],
+            "additionalProperties": False,
+        },
+    }
+]
+
+
+def _tool_specs_for_intent(intent):
+    if intent == "copilot":
+        return READ_ONLY_TOOL_SPECS + WRITE_TOOL_SPECS
+    return READ_ONLY_TOOL_SPECS
+
+
+def _tool_return_to(tool_name):
+    if tool_name == "apply_ops":
+        return "report_render"
+    return "llm_explain"
+
+
+def _safe_previous_response_id(model_name, previous_response_id):
+    provider = _get_model_provider(model_name)
+    if provider != "openai":
+        return ""
+    candidate = str(previous_response_id or "").strip()
+    if not candidate:
+        return ""
+    if candidate.lower().startswith(("gemini", "llama-", "qwen/", "openai/gpt-oss-", "groq/")):
+        return ""
+    return candidate
+
+
+def _system_prompt_for_intent(intent):
+    if intent == "copilot":
+        return (
+            "You are MagicCAD AI for a FreeCAD desktop tool. "
+            "For copilot requests, you may inspect the document with read-only tools and you may apply bounded local CAD write tools. "
+            "Do not claim you cannot create objects. You are not running arbitrary Python; you are selecting from the available desktop tools. "
+            "If the request is specific enough, prefer using apply_ops to create or edit geometry directly. "
+            "When answering directly, briefly describe the action you are taking or the missing information you need."
+        )
+    return (
+        "You are MagicCAD AI. Provide concise, actionable CAD review feedback for a FreeCAD-based desktop tool. "
+        "If you need more detail, call a read-only tool. Never ask to run arbitrary Python. "
+        "When you answer directly, return clear prose only."
+    )
+
 
 def utc_now():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -71,6 +184,31 @@ def utc_now():
 
 def _json_dumps(value):
     return json.dumps(value, sort_keys=True)
+
+
+def _configure_logging(log_path):
+    directory = os.path.dirname(log_path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    absolute_path = os.path.abspath(log_path)
+    for handler in LOGGER.handlers:
+        if isinstance(handler, logging.FileHandler) and getattr(handler, "baseFilename", "") == absolute_path:
+            return absolute_path
+    handler = logging.FileHandler(absolute_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    LOGGER.addHandler(handler)
+    return absolute_path
+
+
+def _log(level, message, **payload):
+    if payload:
+        try:
+            message = "{0} | {1}".format(message, json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            message = "{0} | {1}".format(message, repr(payload))
+    getattr(LOGGER, level, LOGGER.info)(message)
 
 
 class SQLiteRunStore:
@@ -345,17 +483,23 @@ class PromptInterpreter:
             return default
 
 
-class OpenAIResponder:
-    def __init__(self):
+class ResponsesAPIResponder:
+    def __init__(self, api_key_env, provider_name, base_url="", supports_previous_response_id=True):
         self._client = None
         self._error = ""
-        if not os.environ.get("OPENAI_API_KEY"):
-            self._error = "OPENAI_API_KEY is not set"
+        self._provider_name = provider_name
+        self._supports_previous_response_id = supports_previous_response_id
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            self._error = "{0} is not set".format(api_key_env)
             return
         try:
             from openai import OpenAI
 
-            self._client = OpenAI()
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            self._client = OpenAI(**kwargs)
         except Exception as exc:
             self._error = str(exc)
 
@@ -386,21 +530,18 @@ class OpenAIResponder:
             "selection": snapshot.get("selection", []),
             "tool_results": state.get("tool_results", [])[-3:],
         }
-        system_prompt = (
-            "You are MagicCAD AI. Provide concise, actionable CAD review feedback for a FreeCAD-based desktop tool. "
-            "If you need more detail, call a read-only tool. Never ask to run arbitrary Python. "
-            "When you answer directly, return clear prose only."
-        )
+        intent = state.get("intent", "validate")
+        system_prompt = _system_prompt_for_intent(intent)
         kwargs = {
             "model": model,
             "input": [
                 {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                 {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload)}]},
             ],
-            "tools": READ_ONLY_TOOL_SPECS,
+            "tools": _tool_specs_for_intent(intent),
         }
-        previous_response_id = state.get("previous_response_id", "")
-        if previous_response_id:
+        previous_response_id = _safe_previous_response_id(model, state.get("previous_response_id", ""))
+        if previous_response_id and self._supports_previous_response_id:
             kwargs["previous_response_id"] = previous_response_id
         try:
             response = self._client.responses.create(**kwargs)
@@ -436,8 +577,30 @@ class OpenAIResponder:
         }
         if tool_request:
             payload["pending_tool_request"] = tool_request
-            payload["tool_return_to"] = "llm_explain"
+            payload["tool_return_to"] = _tool_return_to(tool_request.get("tool_name", ""))
         return payload
+
+
+class OpenAIResponder(ResponsesAPIResponder):
+    def __init__(self):
+        super(OpenAIResponder, self).__init__("OPENAI_API_KEY", "openai")
+
+
+class GroqResponder(ResponsesAPIResponder):
+    def __init__(self):
+        super(GroqResponder, self).__init__(
+            "GROQ_API_KEY",
+            "groq",
+            base_url="https://api.groq.com/openai/v1",
+            supports_previous_response_id=False,
+        )
+
+    def explain(self, state):
+        result = super(GroqResponder, self).explain(state)
+        # Groq's Responses API does not support previous_response_id, so keep the
+        # model identifier only as lightweight provider context for stored sessions.
+        result["previous_response_id"] = ""
+        return result
 
 
 class GeminiResponder:
@@ -484,17 +647,14 @@ class GeminiResponder:
             "selection": snapshot.get("selection", []),
             "tool_results": state.get("tool_results", [])[-3:],
         }
-        system_prompt = (
-            "You are MagicCAD AI. Provide concise, actionable CAD review feedback for a FreeCAD-based desktop tool. "
-            "If you need more detail, call a read-only tool. Never ask to run arbitrary Python. "
-            "When you answer directly, return clear prose only."
-        )
+        intent = state.get("intent", "validate")
+        system_prompt = _system_prompt_for_intent(intent)
         try:
             response = self._client.models.generate_content(
                 model=model_name,
                 contents=system_prompt + "\n\nUser request: " + json.dumps(payload),
                 config=self._types.GenerateContentConfig(
-                    tools=self._build_gemini_tools(),
+                    tools=self._build_gemini_tools(intent),
                     temperature=0.2,
                     top_p=0.95,
                     top_k=40,
@@ -503,14 +663,15 @@ class GeminiResponder:
             )
             parsed = self._parse_response(response)
             parsed.setdefault("assistant_phase", phase)
-            parsed["previous_response_id"] = model_name
+            parsed["previous_response_id"] = ""
             return parsed
         except Exception as exc:
             self._error = str(exc)
-            return {"assistant_text": "", "assistant_phase": phase, "previous_response_id": model_name}
+            return {"assistant_text": "", "assistant_phase": phase, "previous_response_id": ""}
 
-    def _build_gemini_tools(self):
-        """Build Gemini-compatible tool specs from READ_ONLY_TOOL_SPECS."""
+    def _build_gemini_tools(self, intent):
+        """Build Gemini-compatible tool specs from the intent-specific tool set."""
+        tool_specs = _tool_specs_for_intent(intent)
         return [
             self._types.Tool(
                 function_declarations=[
@@ -519,7 +680,7 @@ class GeminiResponder:
                         description=tool["description"],
                         parameters_json_schema=tool["parameters"],
                     )
-                    for tool in READ_ONLY_TOOL_SPECS
+                    for tool in tool_specs
                 ]
             )
         ]
@@ -530,9 +691,6 @@ class GeminiResponder:
         tool_request = None
 
         try:
-            if hasattr(response, "text") and response.text:
-                text = response.text.strip()
-
             if hasattr(response, "function_calls") and response.function_calls:
                 fc = response.function_calls[0]
                 arguments = getattr(fc, "args", {}) or {}
@@ -543,10 +701,14 @@ class GeminiResponder:
                     "arguments": dict(arguments) if hasattr(arguments, "items") else arguments,
                 }
 
-            if tool_request is None and hasattr(response, "candidates") and response.candidates:
+            text_parts = []
+            if hasattr(response, "candidates") and response.candidates:
                 candidate = response.candidates[0]
                 if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
                     for part in candidate.content.parts:
+                        part_text = getattr(part, "text", "")
+                        if part_text:
+                            text_parts.append(part_text)
                         if hasattr(part, "function_call") and part.function_call:
                             fc = part.function_call
                             arguments = {}
@@ -559,6 +721,8 @@ class GeminiResponder:
                                 "arguments": arguments,
                             }
                             break
+            if text_parts:
+                text = "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
         except Exception:
             pass
 
@@ -569,7 +733,7 @@ class GeminiResponder:
         }
         if tool_request:
             payload["pending_tool_request"] = tool_request
-            payload["tool_return_to"] = "llm_explain"
+            payload["tool_return_to"] = _tool_return_to(tool_request.get("tool_name", ""))
         return payload
 
 
@@ -582,6 +746,7 @@ class LangGraphRuntime:
         self._command_cls = None
         self._interrupt_fn = None
         self._checkpointer = None
+        self._sqlite_conn = None
         try:
             from langgraph.checkpoint.sqlite import SqliteSaver
             from langgraph.graph import END, START, StateGraph
@@ -591,13 +756,14 @@ class LangGraphRuntime:
             return
 
         try:
-            self._checkpointer = SqliteSaver.from_conn_string(database_path)
-        except Exception:
-            try:
-                self._checkpointer = SqliteSaver(sqlite3.connect(database_path, check_same_thread=False))
-            except Exception as exc:
-                self.error = str(exc)
-                return
+            # Newer langgraph versions return a context manager from
+            # from_conn_string(), not a saver instance. Keep an explicit
+            # sqlite connection so graph.compile() always receives SqliteSaver.
+            self._sqlite_conn = sqlite3.connect(database_path, check_same_thread=False)
+            self._checkpointer = SqliteSaver(self._sqlite_conn)
+        except Exception as exc:
+            self.error = str(exc)
+            return
 
         graph = StateGraph(dict)
         graph.add_node("intake", self._wrap("intake", engine.intake))
@@ -657,6 +823,13 @@ class LangGraphRuntime:
             self.error = str(exc)
             self._compiled = None
 
+    def __del__(self):
+        try:
+            if self._sqlite_conn is not None:
+                self._sqlite_conn.close()
+        except Exception:
+            pass
+
     def interrupt(self, payload):
         if not self.available or self._interrupt_fn is None:
             raise RuntimeError("LangGraph interrupt is not available")
@@ -699,6 +872,7 @@ class MagicCADAgentEngine:
         self._store = store
         self._openai_responder = OpenAIResponder()
         self._gemini_responder = GeminiResponder()
+        self._groq_responder = GroqResponder()
         self._local = threading.local()
         self._langgraph = LangGraphRuntime(self, self._store.path)
 
@@ -708,6 +882,8 @@ class MagicCADAgentEngine:
         provider = _get_model_provider(model)
         if provider == "gemini":
             return self._gemini_responder, "gemini"
+        if provider == "groq":
+            return self._groq_responder, "groq"
         return self._openai_responder, "openai"
 
     @property
@@ -773,14 +949,33 @@ class MagicCADAgentEngine:
         responder, provider = self._get_responder(state)
         explanation = responder.explain(state)
         text = explanation.get("assistant_text", "")
+        used_fallback = False
+        backend_warning = ""
         if not text:
+            used_fallback = True
+            backend_warning = _summarize_backend_error(provider, responder.last_error)
             text = self._fallback_explanation(
                 state.get("snapshot", {}),
                 state.get("issues", []),
                 state.get("prompt", ""),
                 state.get("intent", "validate"),
             )
+        _log(
+            "info",
+            "llm_explain",
+            run_id=state.get("run_id", ""),
+            intent=state.get("intent", "validate"),
+            model=state.get("model", DEFAULT_MODEL),
+            provider=provider,
+            responder_available=responder.available,
+            responder_error=responder.last_error,
+            used_fallback=used_fallback,
+            prompt=state.get("prompt", ""),
+            assistant_text=text,
+        )
         run = self.current_run
+        if run is not None and backend_warning:
+            self._publish(run, "backend_warning", provider=provider, message=backend_warning, detail=responder.last_error)
         if run is not None and text:
             self._publish(run, "assistant_delta", text=text, phase=explanation.get("assistant_phase", "llm_explain"))
         updates = {
@@ -792,14 +987,25 @@ class MagicCADAgentEngine:
             "backend": {
                 "openai": self._openai_responder.available,
                 "gemini": self._gemini_responder.available,
+                "groq": self._groq_responder.available,
                 "langgraph": self._langgraph.available,
                 "model": state.get("model", DEFAULT_MODEL),
                 "provider": provider,
+                "responder_available": responder.available,
+                "responder_error": responder.last_error,
+                "used_fallback": used_fallback,
             },
         }
         return updates
 
     def draft_plan(self, state):
+        if state.get("intent") == "copilot" and self._has_successful_apply_ops(state):
+            return {
+                "assistant_phase": "draft_plan",
+                "proposed_changes": [],
+                "approval_status": "approved",
+                "approval_feedback": "",
+            }
         feedback = (state.get("approval_feedback", "") or "").strip()
         proposed_changes = state.get("proposed_changes", [])
         if feedback and proposed_changes:
@@ -897,16 +1103,22 @@ class MagicCADAgentEngine:
         self._set_status(run, "running")
 
         collected = list(state.get("tool_results", []))
-        collected.append(tool_result or {"result": {"ok": False, "error": "No tool result received"}})
-        result_ok = _field(_field(tool_result, "result", {}), "ok", False)
+        tool_payload = dict(tool_result or {"result": {"ok": False, "error": "No tool result received"}})
+        tool_payload.setdefault("tool_name", request.get("tool_name", ""))
+        tool_payload.setdefault("request_id", request.get("request_id", ""))
+        collected.append(tool_payload)
+        result_ok = _field(_field(tool_payload, "result", {}), "ok", False)
         if request.get("tool_name") == "apply_ops":
             if result_ok:
-                self._publish(run, "assistant_delta", text="Approved change applied locally and recomputed.", phase="tool")
+                text = "Local CAD change applied and recomputed." if state.get("intent") == "copilot" else "Approved change applied locally and recomputed."
+                self._publish(run, "assistant_delta", text=text, phase="tool")
             else:
+                error_text = _field(_field(tool_payload, "result", {}), "error", "unknown error")
+                text = "Local CAD change failed: {0}".format(error_text) if state.get("intent") == "copilot" else "Approved change failed locally: {0}".format(error_text)
                 self._publish(
                     run,
                     "assistant_delta",
-                    text="Approved change failed locally: {0}".format(_field(_field(tool_result, "result", {}), "error", "unknown error")),
+                    text=text,
                     phase="tool",
                 )
         return {
@@ -946,6 +1158,7 @@ class MagicCADAgentEngine:
     def _drive_graph(self, run, mode, resume_payload=None):
         self._local.run = run
         try:
+            _log("info", "run_drive_graph", run_id=run.run_id, mode=mode, thread_id=run.thread_id)
             config = {"configurable": {"thread_id": run.thread_id}}
             if mode == "start":
                 run.status = "running"
@@ -969,12 +1182,14 @@ class MagicCADAgentEngine:
             run.status = "completed"
             self._persist(run)
             self._publish(run, "run_finished", status="completed")
+            _log("info", "run_completed", run_id=run.run_id, mode=mode, status=run.status)
             run.close("completed")
             self._persist(run)
         except Exception as exc:
             run.status = "error"
             run.state["error"] = str(exc)
             self._persist(run)
+            _log("error", "run_failed", run_id=run.run_id, mode=mode, error=str(exc), traceback=traceback.format_exc())
             self._publish(run, "run_error", message=str(exc), traceback=traceback.format_exc())
             self._publish(run, "run_finished", status="error")
             run.close("error")
@@ -985,6 +1200,7 @@ class MagicCADAgentEngine:
     def _process_without_langgraph(self, run):
         self._local.run = run
         try:
+            _log("info", "run_process_without_langgraph", run_id=run.run_id, thread_id=run.thread_id)
             run.status = "running"
             self._persist(run)
             self._publish(run, "run_started", status="running")
@@ -1008,12 +1224,14 @@ class MagicCADAgentEngine:
             run.status = "completed"
             self._persist(run)
             self._publish(run, "run_finished", status="completed")
+            _log("info", "run_completed", run_id=run.run_id, mode="without_langgraph", status=run.status)
             run.close("completed")
             self._persist(run)
         except Exception as exc:
             run.status = "error"
             run.state["error"] = str(exc)
             self._persist(run)
+            _log("error", "run_failed", run_id=run.run_id, mode="without_langgraph", error=str(exc), traceback=traceback.format_exc())
             self._publish(run, "run_error", message=str(exc), traceback=traceback.format_exc())
             self._publish(run, "run_finished", status="error")
             run.close("error")
@@ -1038,11 +1256,15 @@ class MagicCADAgentEngine:
                     interrupt_kind="tool",
                     return_node="report_render",
                 )
+                _log("info", "tool_request_published", run_id=run.run_id, request_id=request_id, tool_name="apply_ops", intent=state.get("intent", ""))
                 run.tool_result_event.wait()
-                tool_result = run.pending_tool_result or {"result": {"ok": False, "error": "No tool result received"}}
+                tool_result = dict(run.pending_tool_result or {"result": {"ok": False, "error": "No tool result received"}})
                 run.pending_tool_result = None
                 self._set_status(run, "running")
+                tool_result.setdefault("tool_name", "apply_ops")
+                tool_result.setdefault("request_id", request_id)
                 state.setdefault("tool_results", []).append(tool_result)
+                _log("info", "tool_result_received", run_id=run.run_id, request_id=request_id, result=tool_result)
                 state["approval_status"] = "approved" if _field(_field(tool_result, "result", {}), "ok", False) else "failed"
                 state["applied_change"] = selected
                 state["proposed_changes"] = proposed_changes
@@ -1097,11 +1319,15 @@ class MagicCADAgentEngine:
                 interrupt_kind="tool",
                 return_node="report_render",
             )
+            _log("info", "tool_request_published", run_id=run.run_id, request_id=request_id, tool_name="apply_ops", intent=state.get("intent", ""))
             run.tool_result_event.wait()
-            tool_result = run.pending_tool_result or {"result": {"ok": False, "error": "No tool result received"}}
+            tool_result = dict(run.pending_tool_result or {"result": {"ok": False, "error": "No tool result received"}})
             run.pending_tool_result = None
             self._set_status(run, "running")
+            tool_result.setdefault("tool_name", "apply_ops")
+            tool_result.setdefault("request_id", request_id)
             state.setdefault("tool_results", []).append(tool_result)
+            _log("info", "tool_result_received", run_id=run.run_id, request_id=request_id, result=tool_result)
             state["approval_status"] = "approved" if _field(_field(tool_result, "result", {}), "ok", False) else "failed"
             state["applied_change"] = selected
             state["proposed_changes"] = proposed_changes
@@ -1126,6 +1352,14 @@ class MagicCADAgentEngine:
             if change.get("change_id") == change_id:
                 return change
         return proposed_changes[0]
+
+    def _has_successful_apply_ops(self, state):
+        for item in state.get("tool_results", []):
+            if _field(item, "tool_name", "") != "apply_ops":
+                continue
+            if _field(_field(item, "result", {}), "ok", False):
+                return True
+        return False
 
     def _fallback_explanation(self, snapshot, issues, prompt, intent="validate"):
         object_count = len(snapshot.get("objects", []))
@@ -1206,6 +1440,7 @@ class MagicCADAgentEngine:
                 "requested_model": state.get("model", DEFAULT_MODEL),
                 "openai_enabled": self._openai_responder.available,
                 "gemini_enabled": self._gemini_responder.available,
+                "groq_enabled": self._groq_responder.available,
                 "langgraph_enabled": self._langgraph.available,
                 "langgraph_error": self._langgraph.error,
             },
@@ -1216,6 +1451,8 @@ class MagicCADAgentEngine:
         }
 
     def _publish(self, run, event_name, **payload):
+        if event_name in ("run_started", "run_finished", "run_error", "approval_required", "tool_request", "report_ready"):
+            _log("info", "publish_event", run_id=run.run_id, event=event_name, payload=payload)
         run.publish(event_name, **payload)
         self._persist(run)
 
@@ -1244,10 +1481,12 @@ class ServerState:
             "backends": {
                 "openai": self._engine._openai_responder.available,
                 "gemini": self._engine._gemini_responder.available,
+                "groq": self._engine._groq_responder.available,
             },
             "errors": {
                 "openai": self._engine._openai_responder.last_error if not self._engine._openai_responder.available else "",
                 "gemini": self._engine._gemini_responder.last_error if not self._engine._gemini_responder.available else "",
+                "groq": self._engine._groq_responder.last_error if not self._engine._groq_responder.available else "",
             },
         }
 
@@ -1256,6 +1495,7 @@ class ServerState:
         with self._lock:
             self._runs[run.run_id] = run
         self._store.save_run(run)
+        _log("info", "create_run", run_id=run.run_id, thread_id=run.thread_id, request=request)
         worker = threading.Thread(target=self._engine.start_run, args=(run,), daemon=True)
         worker.start()
         return run
@@ -1276,6 +1516,7 @@ class ServerState:
         run = self.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
+        _log("info", "resume_run", run_id=run_id, decision=decision, payload=payload or {})
         worker = threading.Thread(target=self._engine.resume_approval, args=(run, decision, payload or {}), daemon=True)
         worker.start()
         return {"ok": True, "run_id": run_id, "status": run.status}
@@ -1284,6 +1525,7 @@ class ServerState:
         run = self.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
+        _log("info", "submit_tool_results", run_id=run_id, payload=payload or {})
         worker = threading.Thread(target=self._engine.resume_tool, args=(run, payload or {}), daemon=True)
         worker.start()
         return {"ok": True, "run_id": run_id}
@@ -1411,24 +1653,55 @@ def _safe_json_loads(text, default):
         return default
 
 
+def _summarize_backend_error(provider, error_text):
+    text = (error_text or "").strip()
+    if not text:
+        return ""
+    if provider == "gemini":
+        provider_label = "Gemini"
+    elif provider == "groq":
+        provider_label = "Groq"
+    else:
+        provider_label = "OpenAI"
+    lowered = text.lower()
+    if "resource_exhausted" in lowered or "quota exceeded" in lowered or "429" in lowered:
+        return "{0} quota exhausted (429). Using local fallback.".format(provider_label)
+    if "api key" in lowered and "not set" in lowered:
+        return "{0} API key is not configured. Using local fallback.".format(provider_label)
+    if "permission" in lowered or "forbidden" in lowered or "403" in lowered:
+        return "{0} access was denied (403). Using local fallback.".format(provider_label)
+    if "unauth" in lowered or "401" in lowered:
+        return "{0} authentication failed (401). Using local fallback.".format(provider_label)
+    if "rate limit" in lowered:
+        return "{0} rate limit reached. Using local fallback.".format(provider_label)
+    first_line = text.splitlines()[0].strip()
+    if len(first_line) > 180:
+        first_line = first_line[:177] + "..."
+    return "{0} request failed. Using local fallback. Details: {1}".format(provider_label, first_line)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="MagicCAD AI sidecar server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=50173)
     parser.add_argument("--database", default=os.path.join(os.getcwd(), "magiccadai.sqlite3"))
+    parser.add_argument("--log-file", default="")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    log_path = _configure_logging(args.log_file or os.path.join(os.path.dirname(args.database), "magiccadai.log"))
     server = ThreadingHTTPServer((args.host, args.port), RequestHandler)
     server.state = ServerState(args.database)
+    _log("info", "sidecar_start", host=args.host, port=args.port, database=args.database, log_file=log_path)
     print("MagicCADAI sidecar listening on http://{0}:{1}".format(args.host, args.port), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        _log("info", "sidecar_stop", host=args.host, port=args.port)
         server.server_close()
 
 

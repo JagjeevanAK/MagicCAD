@@ -63,7 +63,7 @@ class SessionProxy(_BaseProxy):
         _ensure_property(obj, "App::PropertyString", "ModelName", "MagicCADAI", "Selected model", "")
         _ensure_property(obj, "App::PropertyString", "LastStatus", "MagicCADAI", "Last run status", "")
         _ensure_property(obj, "App::PropertyString", "LastSnapshotHash", "MagicCADAI", "Last snapshot hash", "")
-        _ensure_property(obj, "App::PropertyString", "PreviousResponseId", "MagicCADAI", "Last OpenAI response id", "")
+        _ensure_property(obj, "App::PropertyString", "PreviousResponseId", "MagicCADAI", "Last provider-specific conversation token", "")
         _ensure_property(obj, "App::PropertyString", "LastPhase", "MagicCADAI", "Last assistant phase", "")
         _ensure_property(obj, "App::PropertyString", "LastUpdatedUtc", "MagicCADAI", "Last update time", "")
         _ensure_property(obj, "App::PropertyString", "Payload", "MagicCADAI", "Serialized session data", "{}")

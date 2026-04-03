@@ -157,11 +157,21 @@ class SidecarBridgeClient(QtCore.QObject):
                 self._process.waitForFinished(1000)
             self._process = None
 
+    def _find_project_root(self, start_dir):
+        current = os.path.abspath(start_dir)
+        while current and current != os.path.dirname(current):
+            if os.path.exists(os.path.join(current, "pixi.toml")):
+                return current
+            current = os.path.dirname(current)
+        return os.path.abspath(os.getcwd())
+
     def _launch_sidecar(self):
         self._port = self._pick_free_port()
         python_exe = get_python_exe() or sys.executable or "python3"
         module_dir = os.path.dirname(__file__)
         sidecar_path = os.path.join(module_dir, "SidecarServer.py")
+        project_root = self._find_project_root(module_dir)
+        log_path = os.path.join(project_root, "magiccadai.log")
         data_dir = os.path.join(FreeCAD.getUserAppDataDir(), "MagicCADAI")
         if not os.path.isdir(data_dir):
             os.makedirs(data_dir)
@@ -181,8 +191,10 @@ class SidecarBridgeClient(QtCore.QObject):
             str(self._port),
             "--database",
             database_path,
+            "--log-file",
+            log_path,
         ]
-        # Inherit environment variables (including GEMINI_API_KEY, OPENAI_API_KEY)
+        # Inherit environment variables (including GEMINI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY)
         env = QtCore.QProcess.systemEnvironment()
         self._process.setEnvironment(env)
         self.statusChanged.emit("Starting MagicCAD AI sidecar...")
