@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 import datetime
+import html as html_lib
 import json
 import os
 import time
@@ -33,6 +34,62 @@ MODEL_OPTIONS = (
 )
 
 
+class MarkdownTextBrowser(QtWidgets.QTextBrowser):
+    def __init__(self, parent=None):
+        super(MarkdownTextBrowser, self).__init__(parent)
+        self.setOpenExternalLinks(True)
+
+    def set_markdown_text(self, text):
+        text = text or ""
+        geometry = self.geometry()
+        if hasattr(super(MarkdownTextBrowser, self), "setMarkdown"):
+            super(MarkdownTextBrowser, self).setMarkdown(text)
+        else:
+            try:
+                import markdown
+
+                self.setHtml(markdown.markdown(text, extensions=["fenced_code", "tables"]))
+            except Exception:
+                self.setPlainText(text)
+        self.setGeometry(geometry)
+
+
+def _escape_markdown_text(text):
+    escaped = text or ""
+    for char in ("\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", "!", "|", ">"):
+        escaped = escaped.replace(char, "\\" + char)
+    return escaped
+
+
+def _issue_markdown(issue):
+    if not issue:
+        return "Select an issue to inspect it."
+
+    lines = [
+        "### {0}".format(issue.get("message", "") or "Issue"),
+        "",
+        "**Severity:** {0}".format(issue.get("severity", "") or "unknown"),
+        "",
+        "**Category:** {0}".format(issue.get("category", "") or "uncategorized"),
+    ]
+    recommendation = issue.get("recommended_fix", "")
+    if recommendation:
+        lines.extend(["", "#### Recommendation", "", recommendation])
+    evidence = issue.get("evidence", {})
+    if evidence:
+        lines.extend(
+            [
+                "",
+                "#### Evidence",
+                "",
+                "```json",
+                json.dumps(evidence, indent=2, sort_keys=True),
+                "```",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def _normalize_save_path(path_result):
     if isinstance(path_result, tuple):
         path_result = path_result[0]
@@ -48,6 +105,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         super(MagicCADAIWidget, self).__init__(parent)
         self._controller = controller
         self._issues = []
+        self._transcript_sections = []
         self._build_ui()
 
     def _build_ui(self):
@@ -105,7 +163,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         self.prompt_input.setMaximumHeight(110)
         tab_layout.addWidget(self.prompt_input)
 
-        self.transcript = QtWidgets.QPlainTextEdit()
+        self.transcript = MarkdownTextBrowser()
         self.transcript.setReadOnly(True)
         tab_layout.addWidget(self.transcript, 1)
         self.tabs.addTab(tab, "Copilot")
@@ -118,7 +176,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
 
         splitter = QtWidgets.QSplitter(Qt.Vertical)
         self.issue_list = QtWidgets.QListWidget()
-        self.issue_details = QtWidgets.QTextBrowser()
+        self.issue_details = MarkdownTextBrowser()
         splitter.addWidget(self.issue_list)
         splitter.addWidget(self.issue_details)
         splitter.setStretchFactor(0, 2)
@@ -139,7 +197,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         tab_layout.setContentsMargins(4, 4, 4, 4)
         tab_layout.setSpacing(6)
 
-        self.report_browser = QtWidgets.QTextBrowser()
+        self.report_browser = MarkdownTextBrowser()
         tab_layout.addWidget(self.report_browser, 1)
 
         report_buttons = QtWidgets.QHBoxLayout()
@@ -166,12 +224,18 @@ class MagicCADAIWidget(QtWidgets.QWidget):
     def set_status(self, text):
         self.status_label.setText(text)
 
-    def append_transcript(self, text):
+    def append_transcript(self, text, markdown=False):
         if not text:
             return
-        self.transcript.appendPlainText(text)
+        if markdown:
+            section = "### Assistant\n\n{0}".format(text)
+        else:
+            section = "### System\n\n{0}".format(_escape_markdown_text(text))
+        self._transcript_sections.append(section)
+        self.transcript.set_markdown_text("\n\n---\n\n".join(self._transcript_sections))
 
     def clear_transcript(self):
+        self._transcript_sections = []
         self.transcript.clear()
 
     def set_issues(self, issues):
@@ -185,7 +249,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         if self._issues:
             self.issue_list.setCurrentRow(0)
         else:
-            self.issue_details.setHtml("<p>No issues detected.</p>")
+            self.issue_details.set_markdown_text("No issues detected.")
 
     def current_issue(self):
         row = self.issue_list.currentRow()
@@ -194,29 +258,20 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         return self._issues[row]
 
     def show_issue_details(self, issue):
-        if not issue:
-            self.issue_details.setHtml("<p>Select an issue to inspect it.</p>")
-            return
-        html = [
-            "<h3>{0}</h3>".format(issue.get("message", "")),
-            "<p><b>Severity:</b> {0}</p>".format(issue.get("severity", "")),
-            "<p><b>Category:</b> {0}</p>".format(issue.get("category", "")),
-            "<p><b>Recommendation:</b> {0}</p>".format(issue.get("recommended_fix", "")),
-        ]
-        evidence = issue.get("evidence", {})
-        if evidence:
-            html.append("<pre>{0}</pre>".format(json.dumps(evidence, indent=2, sort_keys=True)))
-        self.issue_details.setHtml("".join(html))
+        self.issue_details.set_markdown_text(_issue_markdown(issue))
 
     def set_report(self, report):
         if not report:
-            self.report_browser.setHtml("<p>No report available.</p>")
+            self.report_browser.set_markdown_text("No report available.")
             return
+        markdown = report.get("markdown", "")
         html = report.get("html", "")
-        if html:
+        if markdown:
+            self.report_browser.set_markdown_text(markdown)
+        elif html:
             self.report_browser.setHtml(html)
         else:
-            self.report_browser.setPlainText(report.get("markdown", ""))
+            self.report_browser.setHtml("<pre>{0}</pre>".format(html_lib.escape(json.dumps(report, indent=2, sort_keys=True))))
 
     def set_draft_state(self, can_apply, can_revise, can_reject):
         self.apply_button.setEnabled(bool(can_apply))
@@ -470,7 +525,7 @@ class MagicCADAIController(QtCore.QObject):
         elif event_name == "node_status":
             self._set_status("{0}: {1}".format(event.get("node", "node"), event.get("status", "")))
         elif event_name == "assistant_delta":
-            self._widget.append_transcript(event.get("text", ""))
+            self._widget.append_transcript(event.get("text", ""), markdown=True)
         elif event_name == "issues_delta":
             issues = event.get("issues", [])
             self._widget.set_issues(issues)
