@@ -1058,6 +1058,7 @@ class MagicCADAgentEngine:
         pending_tool_request = explanation.get("pending_tool_request")
         used_fallback = False
         backend_warning = ""
+        backend_blocking_error = False
         if not text and not pending_tool_request:
             intent = state.get("intent", "validate")
             error_text = (responder.last_error or "").strip()
@@ -1065,6 +1066,7 @@ class MagicCADAgentEngine:
                 if error_text:
                     text = "Copilot model error: {0}".format(error_text)
                     backend_warning = _summarize_backend_error(provider, error_text) or text
+                    backend_blocking_error = _should_block_copilot_on_backend_error(error_text)
                 else:
                     text = "Copilot model returned no text and no tool call."
                 used_fallback = False
@@ -1101,6 +1103,7 @@ class MagicCADAgentEngine:
             "previous_response_id": explanation.get("previous_response_id", state.get("previous_response_id", "")),
             "pending_tool_request": pending_tool_request,
             "tool_return_to": explanation.get("tool_return_to", ""),
+            "backend_blocking_error": backend_blocking_error,
             "backend": {
                 "openai": self._openai_responder.available,
                 "gemini": self._gemini_responder.available,
@@ -1111,6 +1114,7 @@ class MagicCADAgentEngine:
                 "responder_available": responder.available,
                 "responder_error": responder.last_error,
                 "used_fallback": used_fallback,
+                "blocking_error": backend_blocking_error,
             },
         }
         return updates
@@ -1253,9 +1257,13 @@ class MagicCADAgentEngine:
         return {"assistant_phase": "complete"}
 
     def route_after_llm_explain(self, state):
+        if state.get("backend_blocking_error"):
+            return "report_render"
         return "tool_dispatch" if state.get("pending_tool_request") else "draft_plan"
 
     def route_after_draft_plan(self, state):
+        if state.get("backend_blocking_error"):
+            return "report_render"
         if state.get("pending_tool_request"):
             return "tool_dispatch"
         if state.get("proposed_changes"):
@@ -1795,6 +1803,28 @@ def _summarize_backend_error(provider, error_text):
     if len(first_line) > 180:
         first_line = first_line[:177] + "..."
     return "{0} request failed. Using local fallback. Details: {1}".format(provider_label, first_line)
+
+
+def _should_block_copilot_on_backend_error(error_text):
+    lowered = (error_text or "").lower()
+    if not lowered:
+        return False
+    blockers = (
+        "api key",
+        "authentication",
+        "unauth",
+        "401",
+        "403",
+        "forbidden",
+        "permission",
+        "resource_exhausted",
+        "quota exceeded",
+        "rate limit",
+        "429",
+        "is not set",
+        "invalid argument",
+    )
+    return any(token in lowered for token in blockers)
 
 
 def parse_args(argv=None):

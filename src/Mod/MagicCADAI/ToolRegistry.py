@@ -113,9 +113,9 @@ def get_object_details(document=None, object_name=""):
 
 
 def _create_involute_gear(document, op):
+    _log("create_involute_gear_start", document=getattr(document, "Name", ""), op=op)
     from fcgear import fcgear, involute
 
-    _log("create_involute_gear_start", document=getattr(document, "Name", ""), op=op)
     name = op.get("name", "InvoluteGear")
     thickness = float(op.get("thickness", 0.0) or 0.0)
     bore = float(op.get("center_bore", 0.0) or 0.0)
@@ -142,37 +142,73 @@ def _create_involute_gear(document, op):
         shiftCoeff=shift,
     )
     gear_wire = Part.Wire([segment.toShape() for segment in wire_builder.wire])
-    base_shape = Part.Face(gear_wire)
+    base_face = Part.Face(gear_wire)
 
     created = []
-    result = None
-    if thickness > 0.0:
-        solid_shape = base_shape.extrude(FreeCAD.Vector(0, 0, thickness))
-        if bore > 0.0:
-            solid_shape = solid_shape.cut(Part.makeCylinder(bore / 2.0, thickness))
-        solid = Part.show(solid_shape, name)
-        _style_created_object(solid)
-        _log(
-            "create_involute_gear_solid_created",
-            object_name=solid.Name,
-            shape_type=str(getattr(solid_shape, "ShapeType", "")),
-            volume=float(getattr(solid_shape, "Volume", 0.0)),
-            area=float(getattr(solid_shape, "Area", 0.0)),
-        )
-        created.append(solid.Name)
-        result = solid
-    else:
-        profile = Part.show(gear_wire, name)
-        _style_created_object(profile)
-        _log(
-            "create_involute_gear_profile_created",
-            object_name=profile.Name,
-            shape_type=str(getattr(gear_wire, "ShapeType", "")),
-            length=float(getattr(gear_wire, "Length", 0.0)),
-        )
-        created.append(profile.Name)
-        result = profile
+    _log("create_involute_gear_profile_step_start", name=name + "Profile")
+    profile = document.addObject("Part::Feature", name + "Profile")
+    profile.Shape = base_face
+    created.append(profile.Name)
+    document.recompute()
+    _log(
+        "create_involute_gear_profile_created",
+        object_name=profile.Name,
+        shape_type=str(getattr(getattr(profile, "Shape", None), "ShapeType", "")),
+    )
 
+    result = profile
+    if thickness > 0.0:
+        _log("create_involute_gear_extrusion_step_start", base=profile.Name, thickness=thickness)
+        extrusion = document.addObject("Part::Extrusion", name + "Extrusion")
+        extrusion.Base = profile
+        extrusion.LengthFwd = thickness
+        extrusion.Solid = True
+        created.append(extrusion.Name)
+        document.recompute()
+        result = extrusion
+        _log(
+            "create_involute_gear_extrusion_created",
+            object_name=extrusion.Name,
+            shape_type=str(getattr(getattr(extrusion, "Shape", None), "ShapeType", "")),
+            volume=float(getattr(getattr(extrusion, "Shape", None), "Volume", 0.0)),
+        )
+        try:
+            profile.ViewObject.Visibility = False
+        except Exception:
+            pass
+
+    if thickness > 0.0 and bore > 0.0:
+        _log("create_involute_gear_bore_step_start", base=result.Name, bore=bore, thickness=thickness)
+        bore_tool = document.addObject("Part::Cylinder", name + "Bore")
+        bore_tool.Radius = bore / 2.0
+        bore_tool.Height = thickness
+        document.recompute()
+        final_shape = result.Shape.cut(bore_tool.Shape)
+        cut = document.addObject("Part::Feature", name)
+        cut.Shape = final_shape
+        created.extend([bore_tool.Name, cut.Name])
+        result = cut
+        _log(
+            "create_involute_gear_cut_created",
+            object_name=cut.Name,
+            shape_type=str(getattr(final_shape, "ShapeType", "")),
+            volume=float(getattr(final_shape, "Volume", 0.0)),
+        )
+        for helper in (bore_tool, extrusion if thickness > 0.0 else None):
+            if helper is None:
+                continue
+            try:
+                helper.ViewObject.Visibility = False
+            except Exception:
+                pass
+        try:
+            profile.ViewObject.Visibility = False
+        except Exception:
+            pass
+    elif thickness <= 0.0:
+        _style_created_object(profile)
+
+    _style_created_object(result)
     return _success(created=created, result_object=result.Name)
 
 
