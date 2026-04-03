@@ -3,6 +3,7 @@
 import traceback
 
 import FreeCAD
+import Part
 
 
 def _document(document=None):
@@ -39,51 +40,49 @@ def get_object_details(document=None, object_name=""):
 
 
 def _create_involute_gear(document, op):
-    import InvoluteGearFeature
+    from fcgear import fcgear, involute
 
     name = op.get("name", "InvoluteGear")
-    profile_name = op.get("profile_name", "{0}Profile".format(name))
     thickness = float(op.get("thickness", 0.0) or 0.0)
     bore = float(op.get("center_bore", 0.0) or 0.0)
+    module = float(op.get("module", 2.0) or 2.0)
+    teeth = int(op.get("number_of_teeth", 10) or 10)
+    pressure_angle = float(op.get("pressure_angle", 20.0) or 20.0)
+    external_gear = bool(op.get("external_gear", True))
+    addendum = float(op.get("addendum_coefficient", 1.0 if external_gear else 0.6) or (1.0 if external_gear else 0.6))
+    dedendum = float(op.get("dedendum_coefficient", 1.25) or 1.25)
+    fillet = float(op.get("root_fillet_coefficient", 0.38) or 0.38)
+    shift = float(op.get("profile_shift_coefficient", 0.0) or 0.0)
 
-    profile = InvoluteGearFeature.makeInvoluteGear(profile_name)
-    if "number_of_teeth" in op:
-        profile.NumberOfTeeth = int(op["number_of_teeth"])
-    if "module" in op:
-        profile.Modules = _coerce_quantity(op["module"], "mm")
-    if "pressure_angle" in op:
-        profile.PressureAngle = _coerce_quantity(op["pressure_angle"], "deg")
-    if "external_gear" in op:
-        profile.ExternalGear = bool(op["external_gear"])
+    wire_builder = fcgear.FCWireBuilder()
+    generator = involute.CreateExternalGear if external_gear else involute.CreateInternalGear
+    generator(
+        wire_builder,
+        module,
+        teeth,
+        pressure_angle,
+        split=True,
+        addCoeff=addendum,
+        dedCoeff=dedendum,
+        filletCoeff=fillet,
+        shiftCoeff=shift,
+    )
+    gear_wire = Part.Wire([segment.toShape() for segment in wire_builder.wire])
+    base_shape = Part.Face(gear_wire)
 
-    created = [profile.Name]
-    result = profile
+    created = []
+    result = None
     if thickness > 0.0:
-        extrusion = document.addObject("Part::Extrusion", name)
-        extrusion.Base = profile
-        extrusion.Dir = FreeCAD.Vector(0, 0, thickness)
-        extrusion.Solid = True
-        created.append(extrusion.Name)
-        result = extrusion
-        try:
-            profile.ViewObject.Visibility = False
-        except Exception:
-            pass
-
+        solid_shape = base_shape.extrude(FreeCAD.Vector(0, 0, thickness))
         if bore > 0.0:
-            cylinder = document.addObject("Part::Cylinder", "{0}Bore".format(name))
-            cylinder.Radius = bore / 2.0
-            cylinder.Height = thickness
-            cut = document.addObject("Part::Cut", "{0}Solid".format(name))
-            cut.Base = extrusion
-            cut.Tool = cylinder
-            created.extend([cylinder.Name, cut.Name])
-            result = cut
-            try:
-                extrusion.ViewObject.Visibility = False
-                cylinder.ViewObject.Visibility = False
-            except Exception:
-                pass
+            solid_shape = solid_shape.cut(Part.makeCylinder(bore / 2.0, thickness))
+        solid = Part.show(solid_shape, name)
+        created.append(solid.Name)
+        result = solid
+    else:
+        profile = Part.show(gear_wire, name)
+        created.append(profile.Name)
+        result = profile
 
     return _success(created=created, result_object=result.Name)
 

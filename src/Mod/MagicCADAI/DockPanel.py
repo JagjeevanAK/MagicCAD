@@ -19,6 +19,7 @@ import ToolRegistry
 
 
 QtCore = QtCompat.QtCore
+QtGui = QtCompat.QtGui
 QtWidgets = QtCompat.QtWidgets
 Qt = QtCompat.Qt
 
@@ -107,33 +108,22 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         self._issues = []
         self._transcript_sections = []
         self._build_ui()
+        self._apply_cursor_style()
 
     def _build_ui(self):
+        self.setObjectName("magiccadPanel")
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(8)
-
-        controls = QtWidgets.QGridLayout()
-        controls.setHorizontalSpacing(8)
-        controls.setVerticalSpacing(6)
-
-        controls.addWidget(QtWidgets.QLabel("Model"), 0, 0)
-        self.model_combo = QtWidgets.QComboBox()
-        for model in MODEL_OPTIONS:
-            self.model_combo.addItem(model)
-        self.model_combo.setCurrentIndex(0)
-        controls.addWidget(self.model_combo, 0, 1)
-
-        self.auto_validate = QtWidgets.QCheckBox("Real-time validation")
+        self.auto_validate = QtWidgets.QCheckBox("Live")
         self.auto_validate.setChecked(True)
-        controls.addWidget(self.auto_validate, 0, 2)
+        self.auto_validate.hide()
 
-        self.status_label = QtWidgets.QLabel("MagicCAD AI idle")
-        self.status_label.setWordWrap(True)
-        controls.addWidget(self.status_label, 1, 0, 1, 3)
-        layout.addLayout(controls)
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.hide()
 
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setDocumentMode(True)
         layout.addWidget(self.tabs, 1)
 
         self._build_copilot_tab()
@@ -143,40 +133,55 @@ class MagicCADAIWidget(QtWidgets.QWidget):
     def _build_copilot_tab(self):
         tab = QtWidgets.QWidget()
         tab_layout = QtWidgets.QVBoxLayout(tab)
-        tab_layout.setContentsMargins(4, 4, 4, 4)
-        tab_layout.setSpacing(6)
-
-        button_row = QtWidgets.QHBoxLayout()
-        self.validate_document_button = QtWidgets.QPushButton("Validate Document")
-        self.validate_selection_button = QtWidgets.QPushButton("Validate Selection")
-        self.run_copilot_button = QtWidgets.QPushButton("Run Copilot")
-        button_row.addWidget(self.validate_document_button)
-        button_row.addWidget(self.validate_selection_button)
-        button_row.addWidget(self.run_copilot_button)
-        tab_layout.addLayout(button_row)
-
-        self.prompt_input = QtWidgets.QPlainTextEdit()
-        if hasattr(self.prompt_input, "setPlaceholderText"):
-            self.prompt_input.setPlaceholderText(
-                "Ask for a review, design guidance, or a draft change. Example: Create a gear with 10 teeth, 2 mm module, 8 mm thickness, and 6 mm center bore."
-            )
-        self.prompt_input.setMaximumHeight(110)
-        tab_layout.addWidget(self.prompt_input)
+        tab_layout.setContentsMargins(2, 4, 2, 2)
+        tab_layout.setSpacing(8)
 
         self.transcript = MarkdownTextBrowser()
+        self.transcript.setObjectName("transcriptView")
         self.transcript.setReadOnly(True)
         tab_layout.addWidget(self.transcript, 1)
+
+        composer_card = QtWidgets.QFrame()
+        composer_card.setObjectName("composerCard")
+        composer_layout = QtWidgets.QVBoxLayout(composer_card)
+        composer_layout.setContentsMargins(8, 8, 8, 8)
+        composer_layout.setSpacing(8)
+
+        self.prompt_input = QtWidgets.QPlainTextEdit()
+        self.prompt_input.setObjectName("composer")
+        if hasattr(self.prompt_input, "setPlaceholderText"):
+            self.prompt_input.setPlaceholderText("Describe what to build")
+        self.prompt_input.setMinimumHeight(72)
+        self.prompt_input.setMaximumHeight(110)
+        composer_layout.addWidget(self.prompt_input)
+
+        bottom_row = QtWidgets.QHBoxLayout()
+        bottom_row.setSpacing(8)
+        self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.setObjectName("footerCombo")
+        for model in MODEL_OPTIONS:
+            self.model_combo.addItem(model)
+        self.model_combo.setCurrentIndex(0)
+        bottom_row.addWidget(self.model_combo)
+        self.run_copilot_button = QtWidgets.QPushButton("Submit")
+        self.run_copilot_button.setObjectName("primaryButton")
+        bottom_row.addStretch(1)
+        bottom_row.addWidget(self.run_copilot_button)
+        composer_layout.addLayout(bottom_row)
+        tab_layout.addWidget(composer_card)
         self.tabs.addTab(tab, "Copilot")
 
     def _build_issues_tab(self):
         tab = QtWidgets.QWidget()
         tab_layout = QtWidgets.QVBoxLayout(tab)
-        tab_layout.setContentsMargins(4, 4, 4, 4)
-        tab_layout.setSpacing(6)
+        tab_layout.setContentsMargins(6, 6, 6, 6)
+        tab_layout.setSpacing(8)
 
         splitter = QtWidgets.QSplitter(Qt.Vertical)
         self.issue_list = QtWidgets.QListWidget()
+        self.issue_list.setObjectName("issueList")
         self.issue_details = MarkdownTextBrowser()
+        self.issue_details.setObjectName("detailsView")
         splitter.addWidget(self.issue_list)
         splitter.addWidget(self.issue_details)
         splitter.setStretchFactor(0, 2)
@@ -185,7 +190,9 @@ class MagicCADAIWidget(QtWidgets.QWidget):
 
         issue_buttons = QtWidgets.QHBoxLayout()
         self.highlight_issue_button = QtWidgets.QPushButton("Highlight")
+        self.highlight_issue_button.setObjectName("secondaryButton")
         self.clear_highlight_button = QtWidgets.QPushButton("Clear Highlight")
+        self.clear_highlight_button.setObjectName("ghostButton")
         issue_buttons.addWidget(self.highlight_issue_button)
         issue_buttons.addWidget(self.clear_highlight_button)
         tab_layout.addLayout(issue_buttons)
@@ -194,23 +201,159 @@ class MagicCADAIWidget(QtWidgets.QWidget):
     def _build_report_tab(self):
         tab = QtWidgets.QWidget()
         tab_layout = QtWidgets.QVBoxLayout(tab)
-        tab_layout.setContentsMargins(4, 4, 4, 4)
-        tab_layout.setSpacing(6)
+        tab_layout.setContentsMargins(6, 6, 6, 6)
+        tab_layout.setSpacing(8)
+
+        self.approval_notice = QtWidgets.QLabel("")
+        self.approval_notice.setObjectName("approvalNotice")
+        self.approval_notice.setWordWrap(True)
+        self.approval_notice.hide()
+        tab_layout.addWidget(self.approval_notice)
 
         self.report_browser = MarkdownTextBrowser()
+        self.report_browser.setObjectName("reportView")
         tab_layout.addWidget(self.report_browser, 1)
 
         report_buttons = QtWidgets.QHBoxLayout()
+        report_buttons.setSpacing(8)
         self.apply_button = QtWidgets.QPushButton("Apply Draft")
+        self.apply_button.setObjectName("primaryButton")
         self.revise_button = QtWidgets.QPushButton("Revise Draft")
+        self.revise_button.setObjectName("secondaryButton")
         self.reject_button = QtWidgets.QPushButton("Reject Draft")
+        self.reject_button.setObjectName("ghostButton")
         self.export_button = QtWidgets.QPushButton("Export Report")
+        self.export_button.setObjectName("ghostButton")
         report_buttons.addWidget(self.apply_button)
         report_buttons.addWidget(self.revise_button)
         report_buttons.addWidget(self.reject_button)
         report_buttons.addWidget(self.export_button)
         tab_layout.addLayout(report_buttons)
         self.tabs.addTab(tab, "Report")
+
+    def _apply_cursor_style(self):
+        self.setFont(QtGui.QFont())
+
+        code_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        code_font.setPointSize(10)
+        self.transcript.document().setDefaultFont(code_font)
+        self.issue_details.document().setDefaultFont(code_font)
+        self.report_browser.document().setDefaultFont(code_font)
+
+        self.setStyleSheet(
+            """
+            QWidget#magiccadPanel {
+                background: #171717;
+                color: #e8e8e8;
+            }
+            QLabel#approvalNotice {
+                background: #1d1d1d;
+                border: 1px solid #343434;
+                border-radius: 8px;
+                color: #d7d7d7;
+                padding: 8px 10px;
+            }
+            QFrame#composerCard {
+                background: #1d1d1d;
+                border: 1px solid #2b2b2b;
+                border-radius: 10px;
+            }
+            QComboBox#modelCombo, QComboBox#footerCombo, QPlainTextEdit#composer, QListWidget#issueList,
+            QTextBrowser#transcriptView, QTextBrowser#detailsView, QTextBrowser#reportView {
+                background: #1b1b1b;
+                border: 1px solid #2a2a2a;
+                border-radius: 8px;
+                color: #e8e8e8;
+                selection-background-color: #2b4f73;
+            }
+            QComboBox#modelCombo, QComboBox#footerCombo {
+                min-height: 26px;
+                min-width: 112px;
+                padding: 0 8px;
+                background: #1b1b1b;
+            }
+            QPlainTextEdit#composer {
+                border: none;
+                background: #1d1d1d;
+                padding: 4px 2px;
+            }
+            QListWidget#issueList, QTextBrowser#transcriptView, QTextBrowser#detailsView, QTextBrowser#reportView {
+                padding: 6px;
+            }
+            QListWidget#issueList::item {
+                border-radius: 6px;
+                margin: 2px 0;
+                padding: 7px 9px;
+            }
+            QListWidget#issueList::item:selected {
+                background: #242424;
+                color: #ffffff;
+            }
+            QPushButton {
+                min-height: 28px;
+                border-radius: 8px;
+                padding: 0 10px;
+                font-weight: 600;
+            }
+            QPushButton#primaryButton {
+                background: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                color: #ffffff;
+            }
+            QPushButton#primaryButton:hover {
+                background: #323232;
+            }
+            QPushButton#secondaryButton {
+                background: #1f1f1f;
+                border: 1px solid #303030;
+                color: #cfcfcf;
+            }
+            QPushButton#ghostButton {
+                background: #181818;
+                border: 1px solid #2a2a2a;
+                color: #9a9a9a;
+            }
+            QPushButton#secondaryButton:hover, QPushButton#ghostButton:hover {
+                background: #272727;
+                border-color: #3a3a3a;
+            }
+            QPushButton:disabled {
+                background: #171717;
+                border-color: #242424;
+                color: #666666;
+            }
+            QTabWidget::pane {
+                border: none;
+                background: #171717;
+                margin-top: 0;
+            }
+            QTabBar::tab {
+                background: transparent;
+                color: #878787;
+                padding: 6px 10px;
+                margin-right: 6px;
+                border-bottom: 1px solid transparent;
+                font-weight: 700;
+            }
+            QTabBar::tab:selected {
+                color: #efefef;
+                border-bottom-color: #5d5d5d;
+            }
+            QScrollBar:vertical {
+                background: #171717;
+                width: 8px;
+                margin: 4px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #3a3a3a;
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            """
+        )
 
     def current_model(self):
         return str(self.model_combo.currentText())
@@ -231,6 +374,13 @@ class MagicCADAIWidget(QtWidgets.QWidget):
             section = "### Assistant\n\n{0}".format(text)
         else:
             section = "### System\n\n{0}".format(_escape_markdown_text(text))
+        self._transcript_sections.append(section)
+        self.transcript.set_markdown_text("\n\n---\n\n".join(self._transcript_sections))
+
+    def append_user_transcript(self, text):
+        if not text:
+            return
+        section = "### You\n\n{0}".format(_escape_markdown_text(text))
         self._transcript_sections.append(section)
         self.transcript.set_markdown_text("\n\n---\n\n".join(self._transcript_sections))
 
@@ -259,6 +409,11 @@ class MagicCADAIWidget(QtWidgets.QWidget):
 
     def show_issue_details(self, issue):
         self.issue_details.set_markdown_text(_issue_markdown(issue))
+
+    def set_approval_notice(self, text):
+        text = (text or "").strip()
+        self.approval_notice.setText(text)
+        self.approval_notice.setVisible(bool(text))
 
     def set_report(self, report):
         if not report:
@@ -293,6 +448,7 @@ class MagicCADAIController(QtCore.QObject):
         self._initialized = False
         self._running_run_id = ""
         self._pending_approval = None
+        self._run_meta = {}
         self._last_snapshot = None
         self._last_report = None
         self._last_document_name = ""
@@ -341,6 +497,12 @@ class MagicCADAIController(QtCore.QObject):
     def validate_document(self, document=None, selection_only=False, intent="validate", prompt=None, auto=False):
         document = document or FreeCAD.ActiveDocument
         if document is None:
+            if intent == "copilot" and not auto:
+                document = self._ensure_copilot_document()
+            if document is None:
+                self._set_status("No active document to validate")
+                return
+        if document is None:
             self._set_status("No active document to validate")
             return
         if self._running_run_id:
@@ -377,6 +539,7 @@ class MagicCADAIController(QtCore.QObject):
 
         self._running_run_id = response.get("run_id", "")
         self._pending_approval = None
+        self._run_meta[self._running_run_id] = {"intent": intent, "auto": auto}
         SessionObjects.update_session(
             session,
             thread_id=response.get("thread_id", ""),
@@ -386,15 +549,28 @@ class MagicCADAIController(QtCore.QObject):
             snapshot_hash=snapshot.get("snapshot_hash", ""),
             payload={"intent": intent, "selection_only": selection_only, "auto": auto},
         )
-        if not auto:
-            self._widget.append_transcript(
-                "Started {0} run {1} on {2}".format(intent, response.get("run_id", ""), document.Label)
-            )
         self._widget.set_draft_state(False, False, False)
         self._set_status("MagicCAD AI run in progress...")
 
     def run_copilot(self):
-        self.validate_document(selection_only=False, intent="copilot", prompt=self._widget.current_prompt(), auto=False)
+        prompt = self._widget.current_prompt().strip()
+        if prompt:
+            self._widget.append_user_transcript(prompt)
+            self._widget.prompt_input.clear()
+        self.validate_document(selection_only=False, intent="copilot", prompt=prompt, auto=False)
+
+    def _ensure_copilot_document(self):
+        document = FreeCAD.ActiveDocument
+        if document is not None:
+            return document
+        try:
+            document = FreeCAD.newDocument("MagicCAD")
+        except Exception as exc:
+            self._set_status("Failed to create a new document: {0}".format(exc))
+            return None
+        if document is not None:
+            self._set_status("Created a new document for the copilot run")
+        return document
 
     def apply_pending_draft(self):
         document = FreeCAD.ActiveDocument
@@ -479,12 +655,6 @@ class MagicCADAIController(QtCore.QObject):
 
     def _create_panel(self):
         self._widget = MagicCADAIWidget(self)
-        self._widget.validate_document_button.clicked.connect(
-            lambda: self.validate_document(selection_only=False, intent="validate")
-        )
-        self._widget.validate_selection_button.clicked.connect(
-            lambda: self.validate_document(selection_only=True, intent="validate")
-        )
         self._widget.run_copilot_button.clicked.connect(self.run_copilot)
         self._widget.highlight_issue_button.clicked.connect(self.highlight_current_issue)
         self._widget.clear_highlight_button.clicked.connect(self.clear_highlight)
@@ -501,6 +671,10 @@ class MagicCADAIController(QtCore.QObject):
         self._dock.setWidget(self._widget)
         self._dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         FreeCADGui.getMainWindow().addDockWidget(Qt.RightDockWidgetArea, self._dock)
+
+    def _run_is_interactive(self, run_id):
+        meta = self._run_meta.get(run_id, {})
+        return bool(meta) and not meta.get("auto", False)
 
     def _on_bridge_status(self, status):
         self._set_status(status)
@@ -519,22 +693,30 @@ class MagicCADAIController(QtCore.QObject):
 
         if event_name == "run_started":
             self._running_run_id = run_id
-            self._widget.append_transcript("Run {0} started".format(run_id))
             if session is not None:
                 SessionObjects.update_session(session, run_id=run_id, status="running")
         elif event_name == "node_status":
             self._set_status("{0}: {1}".format(event.get("node", "node"), event.get("status", "")))
         elif event_name == "assistant_delta":
-            self._widget.append_transcript(event.get("text", ""), markdown=True)
+            if self._run_is_interactive(run_id):
+                self._widget.append_transcript(event.get("text", ""), markdown=True)
         elif event_name == "issues_delta":
             issues = event.get("issues", [])
             self._widget.set_issues(issues)
             self._widget.show_issue_details(self._widget.current_issue())
-            self._widget.tabs.setCurrentIndex(1 if issues else 0)
+            if self._run_is_interactive(run_id):
+                self._widget.tabs.setCurrentIndex(1 if issues else 0)
         elif event_name == "approval_required":
             self._pending_approval = event
             self._widget.set_draft_state(True, True, True)
-            self._widget.append_transcript(event.get("message", "Approval is required before applying the proposed change."))
+            proposed_changes = event.get("proposed_changes", []) or []
+            summary_lines = ["# Approval Required", "", event.get("message", "Approval is required before applying the proposed change."), ""]
+            if proposed_changes:
+                summary_lines.append("## Proposed Changes")
+                for change in proposed_changes:
+                    summary_lines.append("- {0}".format(change.get("summary", "")))
+            self._widget.set_report({"markdown": "\n".join(summary_lines)})
+            self._widget.set_approval_notice("Local document changes need approval. Review the draft below, then use Apply Draft, Revise Draft, or Reject Draft.")
             self._widget.tabs.setCurrentIndex(2)
         elif event_name == "tool_request":
             if not document:
@@ -550,9 +732,14 @@ class MagicCADAIController(QtCore.QObject):
                 {"request_id": event.get("request_id", ""), "result": result},
             )
             if result.get("ok", False):
-                self._widget.append_transcript("Executed local tool request: {0}".format(event.get("tool_name", "")))
+                try:
+                    FreeCADGui.SendMsgToActiveView("ViewFit")
+                    FreeCADGui.SendMsgToActiveView("ViewAxo")
+                except Exception:
+                    pass
             else:
-                self._widget.append_transcript("Local tool request failed: {0}".format(result.get("error", "")))
+                if self._run_is_interactive(run_id):
+                    self._widget.append_transcript("Local tool request failed: {0}".format(result.get("error", "")))
         elif event_name == "report_ready":
             report = event.get("report", {})
             self._last_report = report
@@ -568,21 +755,26 @@ class MagicCADAIController(QtCore.QObject):
                     last_phase=report.get("assistant_phase", ""),
                 )
             self._widget.set_report(report)
-            self._widget.tabs.setCurrentIndex(2)
+            self._widget.set_approval_notice("")
+            if not self._run_is_interactive(run_id):
+                self._widget.tabs.setCurrentIndex(2)
             has_pending = bool(self._pending_approval)
             self._widget.set_draft_state(has_pending, has_pending, has_pending)
         elif event_name == "run_error":
-            self._widget.append_transcript("Run error: {0}".format(event.get("message", "")))
+            if self._run_is_interactive(run_id):
+                self._widget.append_transcript("Run error: {0}".format(event.get("message", "")))
             if session is not None:
                 SessionObjects.update_session(session, status="error")
         elif event_name == "run_finished":
             self._running_run_id = ""
             finished_status = event.get("status", "completed")
             self._set_status("Run {0} finished with status {1}".format(run_id, finished_status))
+            self._run_meta.pop(run_id, None)
             if session is not None:
                 SessionObjects.update_session(session, status=finished_status)
             if finished_status != "awaiting_approval":
                 self._pending_approval = None
+                self._widget.set_approval_notice("")
                 self._widget.set_draft_state(False, False, False)
 
     def _set_status(self, text):

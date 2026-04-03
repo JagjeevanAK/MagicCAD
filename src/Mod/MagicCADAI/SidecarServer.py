@@ -443,17 +443,19 @@ class OpenAIResponder:
 class GeminiResponder:
     def __init__(self):
         self._client = None
-        self._model = None
+        self._types = None
         self._error = ""
         if not os.environ.get("GEMINI_API_KEY"):
             self._error = "GEMINI_API_KEY is not set"
             return
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-            self._client = genai
+            from google import genai
+            from google.genai import types
+
+            self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+            self._types = types
         except Exception as exc:
-            self._error = str(exc)
+            self._error = "google-genai is unavailable: {0}".format(exc)
 
     @property
     def available(self):
@@ -488,20 +490,16 @@ class GeminiResponder:
             "When you answer directly, return clear prose only."
         )
         try:
-            if self._model is None or self._model.name != model_name:
-                self._model = self._client.GenerativeModel(model_name)
-            model = self._model
-            response = model.generate_content(
-                contents=[
-                    {"role": "user", "parts": [system_prompt + "\n\nUser request: " + json.dumps(payload)]}
-                ],
-                tools=self._build_gemini_tools(),
-                generation_config={
-                    "temperature": 0.2,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 2048,
-                }
+            response = self._client.models.generate_content(
+                model=model_name,
+                contents=system_prompt + "\n\nUser request: " + json.dumps(payload),
+                config=self._types.GenerateContentConfig(
+                    tools=self._build_gemini_tools(),
+                    temperature=0.2,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=2048,
+                ),
             )
             parsed = self._parse_response(response)
             parsed.setdefault("assistant_phase", phase)
@@ -514,16 +512,16 @@ class GeminiResponder:
     def _build_gemini_tools(self):
         """Build Gemini-compatible tool specs from READ_ONLY_TOOL_SPECS."""
         return [
-            {
-                "function_declarations": [
-                    {
-                        "name": tool["name"],
-                        "description": tool["description"],
-                        "parameters": tool["parameters"],
-                    }
+            self._types.Tool(
+                function_declarations=[
+                    self._types.FunctionDeclaration(
+                        name=tool["name"],
+                        description=tool["description"],
+                        parameters_json_schema=tool["parameters"],
+                    )
                     for tool in READ_ONLY_TOOL_SPECS
                 ]
-            }
+            )
         ]
 
     def _parse_response(self, response):
@@ -535,7 +533,17 @@ class GeminiResponder:
             if hasattr(response, "text") and response.text:
                 text = response.text.strip()
 
-            if hasattr(response, "candidates") and response.candidates:
+            if hasattr(response, "function_calls") and response.function_calls:
+                fc = response.function_calls[0]
+                arguments = getattr(fc, "args", {}) or {}
+                tool_request = {
+                    "request_id": uuid.uuid4().hex,
+                    "call_id": getattr(fc, "id", "") or getattr(fc, "name", ""),
+                    "tool_name": getattr(fc, "name", ""),
+                    "arguments": dict(arguments) if hasattr(arguments, "items") else arguments,
+                }
+
+            if tool_request is None and hasattr(response, "candidates") and response.candidates:
                 candidate = response.candidates[0]
                 if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
                     for part in candidate.content.parts:
@@ -766,7 +774,12 @@ class MagicCADAgentEngine:
         explanation = responder.explain(state)
         text = explanation.get("assistant_text", "")
         if not text:
-            text = self._fallback_explanation(state.get("snapshot", {}), state.get("issues", []), state.get("prompt", ""))
+            text = self._fallback_explanation(
+                state.get("snapshot", {}),
+                state.get("issues", []),
+                state.get("prompt", ""),
+                state.get("intent", "validate"),
+            )
         run = self.current_run
         if run is not None and text:
             self._publish(run, "assistant_delta", text=text, phase=explanation.get("assistant_phase", "llm_explain"))
@@ -808,6 +821,21 @@ class MagicCADAgentEngine:
         proposed_changes = state.get("proposed_changes", [])
         if not proposed_changes:
             return {"approval_status": "not_required"}
+
+        if state.get("intent") == "copilot":
+            selected = self._select_change(proposed_changes, "")
+            request_id = uuid.uuid4().hex
+            return {
+                "approval_status": "approved",
+                "applied_change": selected,
+                "pending_tool_request": {
+                    "request_id": request_id,
+                    "tool_name": "apply_ops",
+                    "arguments": {"ops": selected.get("ops", [])},
+                    "interrupt_kind": "tool",
+                },
+                "tool_return_to": "report_render",
+            }
 
         run = self.current_run
         if run is None:
@@ -996,6 +1024,39 @@ class MagicCADAgentEngine:
     def _approval_loop(self, run, state):
         proposed_changes = list(state.get("proposed_changes", []))
         while proposed_changes:
+            if state.get("intent") == "copilot":
+                selected = self._select_change(proposed_changes, "")
+                request_id = uuid.uuid4().hex
+                run.tool_result_event.clear()
+                self._set_status(run, "awaiting_tool")
+                self._publish(
+                    run,
+                    "tool_request",
+                    request_id=request_id,
+                    tool_name="apply_ops",
+                    arguments={"ops": selected.get("ops", [])},
+                    interrupt_kind="tool",
+                    return_node="report_render",
+                )
+                run.tool_result_event.wait()
+                tool_result = run.pending_tool_result or {"result": {"ok": False, "error": "No tool result received"}}
+                run.pending_tool_result = None
+                self._set_status(run, "running")
+                state.setdefault("tool_results", []).append(tool_result)
+                state["approval_status"] = "approved" if _field(_field(tool_result, "result", {}), "ok", False) else "failed"
+                state["applied_change"] = selected
+                state["proposed_changes"] = proposed_changes
+                if _field(_field(tool_result, "result", {}), "ok", False):
+                    self._publish(run, "assistant_delta", text="Draft change applied locally and recomputed.", phase="tool")
+                else:
+                    self._publish(
+                        run,
+                        "assistant_delta",
+                        text="Draft change failed locally: {0}".format(_field(_field(tool_result, "result", {}), "error", "unknown error")),
+                        phase="tool",
+                    )
+                return state
+
             self._set_status(run, "awaiting_approval")
             run.approval_event.clear()
             self._publish(
@@ -1066,9 +1127,13 @@ class MagicCADAgentEngine:
                 return change
         return proposed_changes[0]
 
-    def _fallback_explanation(self, snapshot, issues, prompt):
+    def _fallback_explanation(self, snapshot, issues, prompt, intent="validate"):
         object_count = len(snapshot.get("objects", []))
         counts = Validators.issue_counts(issues)
+        if intent == "copilot" and prompt:
+            changes = PromptInterpreter.plan_changes(snapshot, prompt, issues)
+            if changes:
+                return "Prepared a draft change for your request. Proposed action: {0}".format(changes[0].get("summary", ""))
         summary = "Reviewed {0} objects and found {1} issues.".format(object_count, counts.get("total", 0))
         if prompt:
             summary += " Request: {0}".format(prompt.strip())
@@ -1082,7 +1147,12 @@ class MagicCADAgentEngine:
         issues = state.get("issues", [])
         proposed_changes = state.get("proposed_changes", [])
         counts = Validators.issue_counts(issues)
-        summary = state.get("assistant_text") or self._fallback_explanation(state.get("snapshot", {}), issues, state.get("prompt", ""))
+        summary = state.get("assistant_text") or self._fallback_explanation(
+            state.get("snapshot", {}),
+            issues,
+            state.get("prompt", ""),
+            state.get("intent", "validate"),
+        )
         markdown_lines = [
             "# MagicCAD AI Validation Report",
             "",
@@ -1284,11 +1354,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, payload):
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _stream_events(self, run):
         self.send_response(200)
