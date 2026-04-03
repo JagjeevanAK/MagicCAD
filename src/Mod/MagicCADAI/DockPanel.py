@@ -455,6 +455,81 @@ class MagicCADAIController(QtCore.QObject):
         self._last_auto_validation_at = 0.0
         self._auto_validation_hold_until = 0.0
 
+    def _iter_created_object_names(self, tool_result):
+        result = tool_result or {}
+        for entry in result.get("results", []) or []:
+            payload = entry.get("result", {}) or {}
+            for name in payload.get("created", []) or []:
+                if name:
+                    yield name
+            result_object = payload.get("result_object", "")
+            if result_object:
+                yield result_object
+
+    def _focus_created_objects(self, document, tool_result):
+        if document is None or not FreeCAD.GuiUp:
+            return
+        created_names = []
+        seen = set()
+        for name in self._iter_created_object_names(tool_result):
+            if name in seen:
+                continue
+            seen.add(name)
+            created_names.append(name)
+        if not created_names:
+            return
+
+        objects = []
+        for name in created_names:
+            obj = document.getObject(name)
+            if obj is None:
+                continue
+            objects.append(obj)
+            view = getattr(obj, "ViewObject", None)
+            if view is not None:
+                try:
+                    view.Visibility = True
+                except Exception:
+                    pass
+                try:
+                    if hasattr(view, "DisplayMode"):
+                        mode_names = []
+                        if hasattr(view, "listDisplayModes"):
+                            mode_names = list(view.listDisplayModes())
+                        preferred = "Flat Lines" if "Flat Lines" in mode_names else ("Shaded" if "Shaded" in mode_names else "")
+                        if preferred:
+                            view.DisplayMode = preferred
+                except Exception:
+                    pass
+                try:
+                    if hasattr(view, "Transparency"):
+                        view.Transparency = 0
+                except Exception:
+                    pass
+
+        if not objects:
+            return
+
+        try:
+            FreeCADGui.Selection.clearSelection(document.Name)
+            for obj in objects:
+                FreeCADGui.Selection.addSelection(document.Name, obj.Name)
+        except Exception:
+            pass
+
+        try:
+            FreeCADGui.activeDocument().activeView().viewAxonometric()
+        except Exception:
+            pass
+        try:
+            FreeCADGui.SendMsgToActiveView("ViewSelection")
+        except Exception:
+            pass
+        try:
+            FreeCADGui.updateGui()
+        except Exception:
+            pass
+
     def ensure_initialized(self):
         if self._initialized:
             return
@@ -662,6 +737,7 @@ class MagicCADAIController(QtCore.QObject):
         self._widget.revise_button.clicked.connect(self.revise_pending_draft)
         self._widget.reject_button.clicked.connect(self.reject_pending_draft)
         self._widget.export_button.clicked.connect(self.export_report)
+        self._widget.tabs.currentChanged.connect(self._on_tab_changed)
         self._widget.issue_list.currentRowChanged.connect(lambda _row: self._widget.show_issue_details(self._widget.current_issue()))
         self._widget.issue_list.itemDoubleClicked.connect(lambda _item: self.highlight_current_issue())
         self._widget.set_draft_state(False, False, False)
@@ -682,6 +758,19 @@ class MagicCADAIController(QtCore.QObject):
     def _on_bridge_error(self, context, message):
         self._widget.append_transcript("Bridge error [{0}]: {1}".format(context, message))
         self._set_status("MagicCAD AI bridge error")
+
+    def _on_tab_changed(self, index):
+        if self._widget is None or index != 2:
+            return
+        report = self._last_report
+        if not report:
+            document = FreeCAD.ActiveDocument
+            if document is not None:
+                _root, _session, report_obj = SessionObjects.ensure_storage(document)
+                report = SessionObjects.report_payload(report_obj)
+                if report:
+                    self._last_report = report
+        self._widget.set_report(report)
 
     def _on_bridge_event(self, event):
         event_name = event.get("event", "")
@@ -732,11 +821,7 @@ class MagicCADAIController(QtCore.QObject):
                 {"request_id": event.get("request_id", ""), "result": result},
             )
             if result.get("ok", False):
-                try:
-                    FreeCADGui.SendMsgToActiveView("ViewFit")
-                    FreeCADGui.SendMsgToActiveView("ViewAxo")
-                except Exception:
-                    pass
+                self._focus_created_objects(document, result)
             else:
                 if self._run_is_interactive(run_id):
                     self._widget.append_transcript("Local tool request failed: {0}".format(result.get("error", "")))
@@ -754,10 +839,9 @@ class MagicCADAIController(QtCore.QObject):
                     previous_response_id=report.get("previous_response_id", ""),
                     last_phase=report.get("assistant_phase", ""),
                 )
-            self._widget.set_report(report)
+            if self._widget.tabs.currentIndex() == 2:
+                self._widget.set_report(report)
             self._widget.set_approval_notice("")
-            if not self._run_is_interactive(run_id):
-                self._widget.tabs.setCurrentIndex(2)
             has_pending = bool(self._pending_approval)
             self._widget.set_draft_state(has_pending, has_pending, has_pending)
         elif event_name == "run_error":

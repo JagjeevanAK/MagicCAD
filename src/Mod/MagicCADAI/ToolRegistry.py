@@ -6,6 +6,53 @@ import FreeCAD
 import Part
 
 
+def _style_created_object(obj):
+    if obj is None or not FreeCAD.GuiUp:
+        return
+    view = getattr(obj, "ViewObject", None)
+    if view is None:
+        return
+    try:
+        view.Visibility = True
+    except Exception:
+        pass
+    try:
+        if hasattr(view, "DisplayMode"):
+            mode_names = []
+            if hasattr(view, "listDisplayModes"):
+                mode_names = list(view.listDisplayModes())
+            preferred = "Shaded" if "Shaded" in mode_names else ("Flat Lines" if "Flat Lines" in mode_names else "")
+            if preferred:
+                view.DisplayMode = preferred
+    except Exception:
+        pass
+    try:
+        if hasattr(view, "ShapeColor"):
+            view.ShapeColor = (0.78, 0.82, 0.88)
+    except Exception:
+        pass
+    try:
+        if hasattr(view, "LineColor"):
+            view.LineColor = (0.18, 0.55, 0.95)
+    except Exception:
+        pass
+    try:
+        if hasattr(view, "PointColor"):
+            view.PointColor = (0.18, 0.55, 0.95)
+    except Exception:
+        pass
+    try:
+        if hasattr(view, "LineWidth"):
+            view.LineWidth = 2.0
+    except Exception:
+        pass
+    try:
+        if hasattr(view, "Transparency"):
+            view.Transparency = 0
+    except Exception:
+        pass
+
+
 def _document(document=None):
     return document or FreeCAD.ActiveDocument
 
@@ -77,10 +124,12 @@ def _create_involute_gear(document, op):
         if bore > 0.0:
             solid_shape = solid_shape.cut(Part.makeCylinder(bore / 2.0, thickness))
         solid = Part.show(solid_shape, name)
+        _style_created_object(solid)
         created.append(solid.Name)
         result = solid
     else:
         profile = Part.show(gear_wire, name)
+        _style_created_object(profile)
         created.append(profile.Name)
         result = profile
 
