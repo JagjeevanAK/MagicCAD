@@ -35,10 +35,17 @@ def _log(message, **payload):
 def _style_created_object(obj):
     if obj is None or not FreeCAD.GuiUp:
         return
+    # Force FreeCAD to evaluate the shape and generate visualization nodes
+    try:
+        obj.purgeTouched()
+    except Exception:
+        pass
     view = getattr(obj, "ViewObject", None)
     if view is None:
         return
     try:
+        if hasattr(view, "show"):
+            view.show()
         view.Visibility = True
     except Exception:
         pass
@@ -158,11 +165,25 @@ def _create_involute_gear(document, op):
 
     result = profile
     if thickness > 0.0:
+        # Use Part::Extrusion to compute the shape (returns proper Part.Shape
+        # via C++ property getter), then IMMEDIATELY copy shape and remove the
+        # Part::Extrusion object. Part::Extrusion has a Base PropertyLink that
+        # causes SIGSEGV when FreeCAD's internal timer calls
+        # ViewProviderExtrusion::claimChildren() → PropertyLink::getValue().
+        # By removing it before returning, we prevent the crash.
         _log("create_involute_gear_extrusion_step_start", base=profile.Name, thickness=thickness)
-        extrusion = document.addObject("Part::Extrusion", name + "Extrusion")
-        extrusion.Base = profile
-        extrusion.LengthFwd = thickness
-        extrusion.Solid = True
+        tmp_extrusion = document.addObject("Part::Extrusion", name + "TmpExtrusion")
+        tmp_extrusion.Base = profile
+        tmp_extrusion.LengthFwd = thickness
+        tmp_extrusion.Solid = True
+        document.recompute()
+        extruded_shape = tmp_extrusion.Shape.copy()
+        # Remove the Part::Extrusion immediately to prevent PropertyLink crash
+        document.removeObject(tmp_extrusion.Name)
+        document.recompute()
+        # Store the computed shape in a safe Part::Feature (no PropertyLinks)
+        extrusion = document.addObject("Part::Feature", name + "Extrusion")
+        extrusion.Shape = extruded_shape
         created.append(extrusion.Name)
         document.recompute()
         result = extrusion
@@ -179,14 +200,18 @@ def _create_involute_gear(document, op):
 
     if thickness > 0.0 and bore > 0.0:
         _log("create_involute_gear_bore_step_start", base=result.Name, bore=bore, thickness=thickness)
-        bore_tool = document.addObject("Part::Cylinder", name + "Bore")
-        bore_tool.Radius = bore / 2.0
-        bore_tool.Height = thickness
+        # Use Part::Cylinder to get proper Part.Shape, then remove it
+        tmp_bore = document.addObject("Part::Cylinder", name + "TmpBore")
+        tmp_bore.Radius = bore / 2.0
+        tmp_bore.Height = thickness
         document.recompute()
-        final_shape = result.Shape.cut(bore_tool.Shape)
+        bore_tool_shape = tmp_bore.Shape.copy()
+        document.removeObject(tmp_bore.Name)
+
+        final_shape = result.Shape.cut(bore_tool_shape)
         cut = document.addObject("Part::Feature", name)
         cut.Shape = final_shape
-        created.extend([bore_tool.Name, cut.Name])
+        created.append(cut.Name)
         result = cut
         _log(
             "create_involute_gear_cut_created",
@@ -194,13 +219,10 @@ def _create_involute_gear(document, op):
             shape_type=str(getattr(final_shape, "ShapeType", "")),
             volume=float(getattr(final_shape, "Volume", 0.0)),
         )
-        for helper in (bore_tool, extrusion if thickness > 0.0 else None):
-            if helper is None:
-                continue
-            try:
-                helper.ViewObject.Visibility = False
-            except Exception:
-                pass
+        try:
+            extrusion.ViewObject.Visibility = False
+        except Exception:
+            pass
         try:
             profile.ViewObject.Visibility = False
         except Exception:
@@ -208,6 +230,7 @@ def _create_involute_gear(document, op):
     elif thickness <= 0.0:
         _style_created_object(profile)
 
+    document.recompute()
     _style_created_object(result)
     return _success(created=created, result_object=result.Name)
 

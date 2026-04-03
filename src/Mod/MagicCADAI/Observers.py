@@ -50,6 +50,7 @@ class MagicCADDocumentObserver:
     def __init__(self, controller):
         self._controller = controller
         self._debouncer = _Debouncer(self._dispatch)
+        self._restoring_documents = set()
 
     def start(self):
         FreeCAD.addDocumentObserver(self)
@@ -63,6 +64,11 @@ class MagicCADDocumentObserver:
     def _schedule(self, reason, document=None):
         document = document or FreeCAD.ActiveDocument
         if document is None:
+            return
+        # Suppress observer events while a document is being restored;
+        # touching objects during restore can crash FreeCAD (SIGABRT in
+        # Part::getPyShapes or SIGSEGV in PropertyLink::getValue).
+        if document.Name in self._restoring_documents:
             return
         self._debouncer.schedule({"reason": reason, "document_name": document.Name})
 
@@ -79,7 +85,15 @@ class MagicCADDocumentObserver:
         self._schedule("created_document", document)
 
     def slotDeletedDocument(self, document):
+        self._restoring_documents.discard(document.Name)
         self._controller.on_document_closed(document)
+
+    def slotStartRestoreDocument(self, document):
+        self._restoring_documents.add(document.Name)
+
+    def slotFinishRestoreDocument(self, document):
+        self._restoring_documents.discard(document.Name)
+        self._schedule("activate", document)
 
     def slotCreatedObject(self, obj):
         if _is_internal_object(obj):

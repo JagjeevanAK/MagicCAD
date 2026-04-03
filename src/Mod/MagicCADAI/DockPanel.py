@@ -4,6 +4,7 @@ import datetime
 import html as html_lib
 import json
 import os
+import re
 import time
 
 import FreeCAD
@@ -82,6 +83,12 @@ def _escape_markdown_text(text):
     for char in ("\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", "!", "|", ">"):
         escaped = escaped.replace(char, "\\" + char)
     return escaped
+
+
+def _replace_camera_scalar(camera_text, field_name, value):
+    pattern = r"(\b{0}\s+)([-+0-9.eE]+)".format(re.escape(field_name))
+    replacement = r"\g<1>{0:.6f}".format(float(value))
+    return re.sub(pattern, replacement, camera_text, count=1)
 
 
 def _issue_markdown(issue):
@@ -572,6 +579,89 @@ class MagicCADAIController(QtCore.QObject):
             return "Tool result: {0} created {1}.".format(tool_name, ", ".join(created))
         return "Tool result: {0} completed successfully.".format(tool_name)
 
+    def _created_objects_max_extent(self, document, created_names):
+        max_extent = 0.0
+        if document is None:
+            return max_extent
+        for name in created_names or []:
+            obj = document.getObject(name)
+            if obj is None:
+                continue
+            shape = getattr(obj, "Shape", None)
+            if shape is None or getattr(shape, "isNull", lambda: True)():
+                continue
+            try:
+                bbox = shape.BoundBox
+                max_extent = max(
+                    max_extent,
+                    float(bbox.XLength),
+                    float(bbox.YLength),
+                    float(bbox.ZLength),
+                )
+            except Exception:
+                continue
+        return max_extent
+
+    def _repair_active_view_camera(self, document_name, created_names, active_view=None):
+        if not FreeCAD.GuiUp:
+            return
+        document = FreeCAD.getDocument(document_name)
+        if document is None:
+            return
+        max_extent = self._created_objects_max_extent(document, created_names)
+        if max_extent <= 0.0:
+            return
+        if active_view is None:
+            try:
+                active_view = FreeCADGui.activeView()
+            except Exception:
+                active_view = None
+        if active_view is None:
+            return
+
+        # The generated parts are small and centered near the origin. Some
+        # focus/view-selection paths leave the orthographic camera with a tiny
+        # height and overly tight clipping planes, which makes the viewport look
+        # empty even though the object exists. Reset both scale and clip range.
+        scale = max(50.0, max_extent * 6.0)
+        try:
+            if hasattr(active_view, "viewDefaultOrientation"):
+                active_view.viewDefaultOrientation("Isometric", scale)
+        except Exception:
+            try:
+                active_view.viewIsometric()
+            except Exception:
+                pass
+
+        try:
+            camera_text = active_view.getCamera() if hasattr(active_view, "getCamera") else ""
+        except Exception:
+            camera_text = ""
+        if camera_text:
+            near_distance = max(0.1, scale * 0.01)
+            far_distance = max(scale * 20.0, near_distance + max_extent * 20.0)
+            camera_text = _replace_camera_scalar(camera_text, "nearDistance", near_distance)
+            camera_text = _replace_camera_scalar(camera_text, "farDistance", far_distance)
+            camera_text = _replace_camera_scalar(camera_text, "focalDistance", scale)
+            if "OrthographicCamera" in camera_text:
+                camera_text = _replace_camera_scalar(camera_text, "height", scale)
+            try:
+                active_view.setCamera(camera_text)
+            except Exception:
+                pass
+
+        try:
+            FreeCADGui.updateGui()
+        except Exception:
+            pass
+        self._log_debug(
+            "focus_created_camera_repair",
+            document=document_name,
+            created_names=created_names,
+            max_extent=max_extent,
+            scale=scale,
+        )
+
     def _focus_created_objects(self, document, tool_result):
         if document is None or not FreeCAD.GuiUp:
             return
@@ -584,6 +674,21 @@ class MagicCADAIController(QtCore.QObject):
             created_names.append(name)
         if not created_names:
             return
+
+        # Determine which object is the final result — only that one should be
+        # made visible and focused. Intermediate helpers (profiles, extrusion
+        # bodies) are intentionally hidden by the ToolRegistry.
+        result_object_name = ""
+        if isinstance(tool_result, dict):
+            result_object_name = tool_result.get("result_object", "")
+            if not result_object_name:
+                for sub in tool_result.get("results", []):
+                    r = sub.get("result", {}) if isinstance(sub, dict) else {}
+                    result_object_name = r.get("result_object", "")
+                    if result_object_name:
+                        break
+        if not result_object_name:
+            result_object_name = created_names[-1] if created_names else ""
 
         objects = []
         for name in created_names:
@@ -610,7 +715,10 @@ class MagicCADAIController(QtCore.QObject):
                 except Exception:
                     bbox_payload = {}
             view = getattr(obj, "ViewObject", None)
-            if view is not None:
+            # Only force visibility on the result object; leave intermediates
+            # hidden as the ToolRegistry set them.
+            is_result = (obj.Name == result_object_name)
+            if view is not None and is_result:
                 try:
                     view.Visibility = True
                 except Exception:
@@ -660,24 +768,78 @@ class MagicCADAIController(QtCore.QObject):
         if not objects:
             return
 
+        # Defer selection/focus until the GUI has had time to register the new
+        # view provider. A single next-tick focus is not reliable enough here:
+        # the object exists in the document, but the 3D scene can still lag one
+        # or two event cycles behind.
+        doc_name = document.Name
+        focus_names = [result_object_name] if result_object_name else list(created_names)
+        retry_delays_ms = (0, 150, 500)
+        for attempt, delay_ms in enumerate(retry_delays_ms):
+            QtCore.QTimer.singleShot(
+                delay_ms,
+                lambda doc_name=doc_name, focus_names=list(focus_names), attempt=attempt: self._deferred_focus(
+                    doc_name,
+                    focus_names,
+                    attempt,
+                    final_attempt=(attempt == len(retry_delays_ms) - 1),
+                ),
+            )
+
+    def _deferred_focus(self, document_name, created_names, attempt=0, final_attempt=False):
+        """Focus created objects after the event loop has processed pending updates."""
         try:
-            FreeCADGui.Selection.clearSelection(document.Name)
-            for obj in objects:
-                FreeCADGui.Selection.addSelection(document.Name, obj.Name)
+            document = FreeCAD.getDocument(document_name)
+            if document is None:
+                return
+            if attempt == 0:
+                # Recompute once before the first focus pass so the later retries
+                # only pay the GUI-sync cost.
+                document.recompute()
+            FreeCADGui.updateGui()
+            FreeCADGui.Selection.clearSelection(document_name)
+            for name in created_names:
+                obj = document.getObject(name)
+                if obj is not None:
+                    FreeCADGui.Selection.addSelection(document_name, name)
+            self._apply_document_focus(document_name, created_names)
+            # Explicitly fit the view
+            try:
+                gui_doc = FreeCADGui.getDocument(document_name)
+                active_view = getattr(gui_doc, "ActiveView", None)
+                if active_view is not None:
+                    active_view.fitAll()
+                    self._repair_active_view_camera(document_name, created_names, active_view=active_view)
+                else:
+                    FreeCADGui.SendMsgToActiveView("ViewFit")
+                    self._repair_active_view_camera(document_name, created_names)
+            except Exception:
+                pass
+            try:
+                FreeCADGui.updateGui()
+            except Exception:
+                pass
         except Exception:
             pass
-
-        self._apply_document_focus(document.Name, created_names)
         try:
-            selection_names = [obj.Name for obj in FreeCADGui.Selection.getSelection(document.Name)]
+            selection_names = [obj.Name for obj in FreeCADGui.Selection.getSelection(document_name)]
         except Exception:
             selection_names = []
         self._log_debug(
-            "focus_created_objects_complete",
-            document=getattr(document, "Name", ""),
+            "focus_created_objects_attempt",
+            document=document_name,
             created_names=created_names,
             selection=selection_names,
+            attempt=attempt,
+            final_attempt=bool(final_attempt),
         )
+        if final_attempt:
+            self._log_debug(
+                "focus_created_objects_complete",
+                document=document_name,
+                created_names=created_names,
+                selection=selection_names,
+            )
 
     def _apply_document_focus(self, document_name, created_names):
         if not document_name or not FreeCAD.GuiUp:
@@ -1150,7 +1312,9 @@ class MagicCADAIController(QtCore.QObject):
                 SessionObjects.update_session(session, status="error")
         elif event_name == "run_finished":
             self._running_run_id = ""
-            self._handled_tool_request_ids.clear()
+            # Do NOT clear _handled_tool_request_ids here — tool_request events
+            # can arrive after run_finished due to graph resume re-emitting them.
+            # The set is cleared on the next run_started instead.
             finished_status = event.get("status", "completed")
             self._set_status("Run {0} finished with status {1}".format(run_id, finished_status))
             self._run_meta.pop(run_id, None)
