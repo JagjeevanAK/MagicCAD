@@ -263,6 +263,23 @@ def _create_box(document, op):
     return _success(created=[box.Name], result_object=box.Name)
 
 
+def _create_cylinder(document, op):
+    name = op.get("name", "Cylinder")
+    radius = float(op.get("radius", 5.0) or 5.0)
+    height = float(op.get("height", op.get("z", 10.0)) or 10.0)
+    cylinder = document.addObject("Part::Cylinder", name)
+    cylinder.Radius = radius
+    cylinder.Height = height
+    _style_created_object(cylinder)
+    _log(
+        "create_cylinder_created",
+        object_name=getattr(cylinder, "Name", ""),
+        radius=radius,
+        height=height,
+    )
+    return _success(created=[cylinder.Name], result_object=cylinder.Name)
+
+
 def _rename_object(document, op):
     object_name = op.get("object_name", "")
     new_label = op.get("new_label", "")
@@ -296,6 +313,8 @@ def _apply_operation(document, op):
     op_name = op.get("op", "")
     if op_name == "create_involute_gear":
         return _create_involute_gear(document, op)
+    if op_name == "create_cylinder":
+        return _create_cylinder(document, op)
     if op_name == "create_body":
         return _create_body(document, op)
     if op_name == "create_box":

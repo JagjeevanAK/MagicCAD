@@ -191,6 +191,7 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         for model in MODEL_OPTIONS:
             self.model_combo.addItem(model)
         self.set_current_model(DEFAULT_MODEL)
+        self.model_combo.currentTextChanged.connect(self._on_model_changed)
         bottom_row.addWidget(self.model_combo)
         self.run_copilot_button = QtWidgets.QPushButton("Submit")
         self.run_copilot_button.setObjectName("primaryButton")
@@ -400,6 +401,11 @@ class MagicCADAIWidget(QtWidgets.QWidget):
             index = 0
         self.model_combo.setCurrentIndex(index)
 
+    def _on_model_changed(self, text):
+        """Track when user manually changes the model selection."""
+        if self._controller is not None:
+            self._controller._user_selected_model = True
+
     def current_prompt(self):
         return str(self.prompt_input.toPlainText())
 
@@ -502,6 +508,7 @@ class MagicCADAIController(QtCore.QObject):
         self._last_document_name = ""
         self._last_auto_validation_at = 0.0
         self._auto_validation_hold_until = 0.0
+        self._user_selected_model = False
         self.toolRequestQueued.connect(self._execute_tool_request_on_gui_thread)
 
     def _log_debug(self, message, **payload):
@@ -536,6 +543,9 @@ class MagicCADAIController(QtCore.QObject):
 
     def _sync_model_from_document(self, document=None):
         if self._widget is None:
+            return
+        # Don't override user's manual model selection from session data
+        if self._user_selected_model:
             return
         document = document or FreeCAD.ActiveDocument
         if document is None:
@@ -999,6 +1009,10 @@ class MagicCADAIController(QtCore.QObject):
 
     def on_document_event(self, reason, document):
         if reason in ("activate", "created_document"):
+            # Reset user selection flag when switching to a different document
+            # so it syncs from the new document's session
+            if document and document.Name != self._last_document_name:
+                self._user_selected_model = False
             self._sync_model_from_document(document)
         if not self._should_auto_validate(document):
             return
@@ -1018,6 +1032,8 @@ class MagicCADAIController(QtCore.QObject):
             self._last_document_name = ""
             self._last_snapshot = None
             self._last_report = None
+            # Reset user selection when document is closed
+            self._user_selected_model = False
             if self._widget is not None:
                 self._widget.set_issues([])
                 self._widget.set_report(None)
