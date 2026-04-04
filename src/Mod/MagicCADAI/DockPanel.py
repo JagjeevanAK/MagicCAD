@@ -193,6 +193,9 @@ class MagicCADAIWidget(QtWidgets.QWidget):
         self.set_current_model(DEFAULT_MODEL)
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
         bottom_row.addWidget(self.model_combo)
+        self.clear_chat_button = QtWidgets.QPushButton("Clear Chat")
+        self.clear_chat_button.setObjectName("ghostButton")
+        bottom_row.addWidget(self.clear_chat_button)
         self.run_copilot_button = QtWidgets.QPushButton("Submit")
         self.run_copilot_button.setObjectName("primaryButton")
         self.run_copilot_button.setEnabled(False)
@@ -1112,6 +1115,47 @@ class MagicCADAIController(QtCore.QObject):
         self._widget.prompt_input.clear()
         self.validate_document(selection_only=False, intent="copilot", prompt=prompt, auto=False)
 
+    def clear_context(self):
+        """Clear the current AI conversation context and reset the session."""
+        document = FreeCAD.ActiveDocument
+        if document is None:
+            self._set_status("No active document")
+            return
+
+        # Reset the session storage
+        root, session, report_obj = SessionObjects.ensure_storage(document)
+        SessionObjects.update_session(
+            session,
+            thread_id="",
+            run_id="",
+            model="",
+            status="",
+            snapshot_hash="",
+            previous_response_id="",
+            last_phase="",
+            payload={},
+        )
+
+        # Clear the transcript
+        if self._widget is not None:
+            self._widget.clear_transcript()
+            self._widget.append_transcript("Conversation context cleared. Starting fresh conversation.", markdown=False)
+
+        # Reset internal state
+        self._running_run_id = ""
+        self._pending_approval = None
+        self._run_meta.clear()
+        self._handled_tool_request_ids.clear()
+        self._last_snapshot = None
+        self._last_report = None
+        self._user_selected_model = False
+
+        # Sync model from document
+        self._sync_model_from_document(document)
+
+        self._set_status("Conversation context cleared")
+        self._log_debug("clear_context", document=getattr(document, "Name", ""))
+
     def _ensure_copilot_document(self):
         document = FreeCAD.ActiveDocument
         if document is not None:
@@ -1209,6 +1253,7 @@ class MagicCADAIController(QtCore.QObject):
     def _create_panel(self):
         self._widget = MagicCADAIWidget(self)
         self._widget.run_copilot_button.clicked.connect(self.run_copilot)
+        self._widget.clear_chat_button.clicked.connect(self.clear_context)
         self._widget.highlight_issue_button.clicked.connect(self.highlight_current_issue)
         self._widget.clear_highlight_button.clicked.connect(self.clear_highlight)
         self._widget.apply_button.clicked.connect(self.apply_pending_draft)
