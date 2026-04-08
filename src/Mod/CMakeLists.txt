@@ -38,6 +38,10 @@ if(BUILD_INSPECTION)
   add_subdirectory(Inspection)
 endif(BUILD_INSPECTION)
 
+if(BUILD_MAGICCAD_AI)
+  add_subdirectory(MagicCADAI)
+endif(BUILD_MAGICCAD_AI)
+
 if(BUILD_JTREADER)
   add_subdirectory(JtReader)
 endif(BUILD_JTREADER)
